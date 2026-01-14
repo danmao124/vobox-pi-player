@@ -9,7 +9,11 @@ MAIN_LIST="${STATE_DIR}/main.txt"
 PENDING_LIST="${STATE_DIR}/pending.txt"
 INDEX_FILE="${STATE_DIR}/index.txt"
 NEXT_FILE="${STATE_DIR}/next.txt"
-MPV_PLAYLIST="${STATE_DIR}/mpv.m3u"
+
+VIEW_PATH="view/billboard"
+
+# mpv IPC socket (lives in RAM; fine)
+MPV_SOCK="/tmp/venditt-mpv.sock"
 
 # ---------- load config ----------
 if [[ ! -f "$CONFIG" ]]; then
@@ -25,22 +29,16 @@ source "$CONFIG"
 IMAGE_SECONDS="${IMAGE_SECONDS:-15}"
 MAX_CACHE_MB="${MAX_CACHE_MB:-30000}" # 30GB
 
-VIEW_PATH="view/billboard"
-
 CURL_OPTS=(--fail --silent --show-error --connect-timeout 5 --max-time 20 -L)
 JQ_URLS='.response.data[]?.url // empty'
 JQ_NEXT='.response.message // empty'
 
-# mpv: one instance plays a whole playlist (no terminal flashes)
-MPV_OPTS=(
-  --fs --no-border --really-quiet
-  --hwdec=auto
-  --mute=yes --volume=0
-  --image-display-duration="${IMAGE_SECONDS}"
-  --keep-open=no
-)
-
 log(){ echo "[$(date '+%F %T')] $*"; }
+
+is_video() {
+  local u="${1,,}"
+  [[ "$u" == *".mp4"* || "$u" == *".webm"* ]]
+}
 
 ensure_dirs() {
   mkdir -p "$STATE_DIR" "$ASSET_DIR"
@@ -55,7 +53,6 @@ if [[ "${AUTH_HEADER:-}" != "" ]]; then
 fi
 
 fetch_batch_to() {
-  # args: index outfile nextfile
   local idx="$1"
   local out="$2"
   local nextfile="$3"
@@ -95,7 +92,6 @@ cache_path_for_url() {
 }
 
 cache_asset() {
-  # prints local path if downloaded, else original url
   local url="$1"
   local path tmp
   path="$(cache_path_for_url "$url")"
@@ -136,7 +132,6 @@ cleanup_cache() {
 
   log "Cache cleanup: ${used_mb}MB used, trimming to ${MAX_CACHE_MB}MB"
 
-  # Delete oldest files first
   find "$ASSET_DIR" -type f -printf '%T@ %p\n' \
     | sort -n \
     | while read -r _ file; do
@@ -154,31 +149,97 @@ swap_pending_if_any() {
   fi
 
   cleanup_cache
-
-  # always fetch next in background
   background_fetch_pending & disown || true
 }
 
-build_mpv_playlist_from_main() {
-  : > "$MPV_PLAYLIST"
-  while IFS= read -r url; do
-    [[ -n "$url" ]] || continue
-    echo "$(cache_asset "$url")" >> "$MPV_PLAYLIST"
-  done < "$MAIN_LIST"
+# ---------------- mpv IPC ----------------
+mpv_send() {
+  printf '%s\n' "$1" | socat - UNIX-CONNECT:"$MPV_SOCK" >/dev/null 2>&1 || true
 }
 
-run_batch_playlist_once() {
-  build_mpv_playlist_from_main
-  local n
-  n="$(wc -l < "$MPV_PLAYLIST" | tr -d ' ')"
-  if [[ "$n" == "0" ]]; then
-    log "WARN: mpv playlist empty; skipping"
-    return 1
+mpv_query() {
+  printf '%s\n' "$1" | socat - UNIX-CONNECT:"$MPV_SOCK" 2>/dev/null || true
+}
+
+mpv_get_idle() {
+  local r
+  r="$(mpv_query '{"command":["get_property","idle-active"]}')"
+  echo "$r" | grep -q '"data":true'
+}
+
+start_mpv_if_needed() {
+  if [[ -S "$MPV_SOCK" ]]; then
+    return 0
   fi
 
-  log "mpv playing batch ($n items)"
-  mpv "${MPV_OPTS[@]}" --playlist="$MPV_PLAYLIST" || true
-  return 0
+  rm -f "$MPV_SOCK" || true
+  log "Starting mpv (persistent fullscreen, IPC)"
+
+  mpv --fs --no-border --really-quiet \
+      --hwdec=auto \
+      --mute=yes --volume=0 \
+      --idle=yes --force-window=yes \
+      --no-osc --cursor-autohide=always \
+      --input-ipc-server="$MPV_SOCK" \
+      >/dev/null 2>&1 &
+
+  # wait for socket
+  for _ in {1..80}; do
+    [[ -S "$MPV_SOCK" ]] && return 0
+    sleep 0.1
+  done
+
+  log "ERROR: mpv IPC socket did not appear"
+  return 1
+}
+
+mpv_wait_until_not_idle() {
+  # Wait until playback actually starts (idle-active becomes false).
+  # Prevents instant "finished" on load failure.
+  for _ in {1..100}; do
+    if ! mpv_get_idle; then
+      return 0
+    fi
+    sleep 0.1
+  done
+  return 1
+}
+
+mpv_wait_until_idle() {
+  # Wait until playback ends (idle-active becomes true again)
+  while true; do
+    if mpv_get_idle; then
+      return 0
+    fi
+    sleep 0.25
+  done
+}
+
+play_url() {
+  local url="$1"
+  local src
+  src="$(cache_asset "$url")"
+
+  start_mpv_if_needed
+
+  # Load file into the already-open fullscreen window
+  mpv_send "{\"command\":[\"loadfile\",\"$src\",\"replace\"]}"
+
+  # If it never leaves idle, the file probably failed; skip.
+  if ! mpv_wait_until_not_idle; then
+    log "WARN: playback did not start, skipping: $url"
+    return 0
+  fi
+
+  if is_video "$url"; then
+    # video ends naturally -> mpv returns to idle
+    mpv_wait_until_idle
+  else
+    # images don't end -> we control timing then stop
+    sleep "$IMAGE_SECONDS"
+    mpv_send '{"command":["stop"]}'
+    mpv_wait_until_idle
+  fi
 }
 
 main() {
@@ -194,8 +255,10 @@ main() {
   done
   mv "$NEXT_FILE" "$INDEX_FILE"
 
-  # fetch next batch in background
   background_fetch_pending & disown || true
+
+  # Start mpv once, forever
+  start_mpv_if_needed
 
   while true; do
     if [[ ! -s "$MAIN_LIST" ]]; then
@@ -205,10 +268,16 @@ main() {
       continue
     fi
 
-    # Play current batch with a single mpv invocation (no terminal flashes)
-    run_batch_playlist_once || sleep 1
+    local n
+    n="$(wc -l < "$MAIN_LIST" | tr -d ' ')"
+    log "Playing batch ($n items)"
 
-    # When batch finishes, swap pending and prepare next
+    while IFS= read -r url; do
+      [[ -n "$url" ]] || continue
+      play_url "$url"
+    done < "$MAIN_LIST"
+
+    # end of batch -> swap pending and continue
     swap_pending_if_any
   done
 }
