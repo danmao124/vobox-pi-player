@@ -48,7 +48,7 @@ log(){ echo "[$(date '+%F %T')] $*"; }
 
 is_video() {
   local u="${1,,}"
-  [[ "$u" == *".mp4"* || "$u" == *".webm"* ]]
+  [[ "$u" == *".mp4"* || "$u" == *".webm"* || "$u" == *".m4v"* || "$u" == *".mov"* || "$u" == *".mkv"* ]]
 }
 
 ensure_dirs() {
@@ -170,12 +170,6 @@ mpv_send() {
 
 mpv_query() {
   printf '%s\n' "$1" | socat - UNIX-CONNECT:"$MPV_SOCK" 2>/dev/null || true
-}
-
-mpv_get_idle() {
-  local r
-  r="$(mpv_query '{"command":["get_property","idle-active"]}')"
-  echo "$r" | grep -q '"data":true'
 }
 
 start_mpv_if_needed() {
