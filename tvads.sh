@@ -192,19 +192,12 @@ start_mpv_if_needed() {
   log "Starting mpv (persistent fullscreen, IPC)"
 
   mpv --fs --no-border --really-quiet \
-    --hwdec=auto \
-    --vo=gpu-next \
-    --gpu-api=opengl \
-    --keep-open=yes \
-    --force-window=yes \
-    --video-unscaled=yes \
-    --opengl-pbo \
-    --idle=yes \
-    --no-osc \
-    --cursor-autohide=always \
-    --mute=yes --volume=0 \
-    --input-ipc-server="$MPV_SOCK" \
-    >/dev/null 2>&1 &
+      --hwdec=auto \
+      --mute=yes --volume=0 \
+      --idle=yes --force-window=yes \
+      --no-osc --cursor-autohide=always \
+      --input-ipc-server="$MPV_SOCK" \
+      >/dev/null 2>&1 &
 
   # wait for socket
   for _ in {1..80}; do
