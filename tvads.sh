@@ -238,23 +238,18 @@ play_url() {
   src="$(cache_asset "$url")"
 
   start_mpv_if_needed
-
-  # Load file into the already-open fullscreen window
   mpv_send "{\"command\":[\"loadfile\",\"$src\",\"replace\"]}"
 
-  # If it never leaves idle, the file probably failed; skip.
   if ! mpv_wait_until_not_idle; then
     log "WARN: playback did not start, skipping: $url"
     return 0
   fi
 
   if is_video "$url"; then
-    # video ends naturally -> mpv returns to idle
     mpv_wait_until_idle
   else
-    # images don't end -> we control timing then stop
-    mpv_send '{"command":["stop"]}'
-    mpv_wait_until_idle
+    sleep "$IMAGE_SECONDS"
+    # don't stop; don't wait idle
   fi
 }
 
