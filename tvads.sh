@@ -319,6 +319,7 @@ main() {
 
     while IFS= read -r url; do
       [[ -n "$url" ]] || continue
+      log "RAW URL: $(printf '%q' "$url")"
       play_url "$url"
     done < "$MAIN_LIST"
 
