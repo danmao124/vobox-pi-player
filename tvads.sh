@@ -192,13 +192,14 @@ start_mpv_if_needed() {
   log "Starting mpv (persistent fullscreen, IPC)"
 
   mpv --fs --no-border --really-quiet \
-      --hwdec=auto \
-      --mute=yes --volume=0 \
-      --idle=yes --force-window=yes \
-      --no-osc --cursor-autohide=always \
-      --vo=gpu-next \
-      --input-ipc-server="$MPV_SOCK" \
-      >/dev/null 2>&1 &
+    --hwdec=auto \
+    --mute=yes --volume=0 \
+    --idle=yes --force-window=yes \
+    --no-osc --cursor-autohide=always \
+    --keep-open=always --keep-open-pause=no \
+    --vo=gpu \
+    --input-ipc-server="$MPV_SOCK" \
+    >/dev/null 2>&1 &
 
   # wait for socket
   for _ in {1..80}; do
@@ -234,7 +235,6 @@ mpv_wait_until_playback_starts() {
   return 1
 }
 
-
 mpv_set_prop() {
   local prop="$1" val="$2"
   mpv_send "{\"command\":[\"set_property\",\"$prop\",\"$val\"]}"
@@ -248,10 +248,7 @@ play_url() {
   start_mpv_if_needed
 
   if is_video "$url"; then
-    mpv_set_prop "keep-open" "no"
-    mpv_set_prop "eof-reached" "no" || true   # reset BEFORE load
-  else
-    mpv_set_prop "keep-open" "always"
+    mpv_set_prop "eof-reached" "no" || true
   fi
 
   mpv_send "{\"command\":[\"loadfile\",\"$src\",\"replace\"]}"
@@ -263,11 +260,12 @@ play_url() {
 
   if is_video "$url"; then
     mpv_wait_until_eof
+    # do NOT stop; keep-open holds last frame until next loadfile
   else
     sleep "$IMAGE_SECONDS"
+    # do NOT stop; next loadfile replaces seamlessly
   fi
 }
-
 
 main() {
   ensure_dirs
