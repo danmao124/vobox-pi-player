@@ -39,7 +39,8 @@ source "$CONFIG"
 IMAGE_SECONDS="${IMAGE_SECONDS:-15}"
 MAX_CACHE_MB="${MAX_CACHE_MB:-30000}" # 30GB
 
-CURL_OPTS=(--fail --silent --show-error --connect-timeout 5 --max-time 20 -L)
+CURL_API_OPTS=(--fail --silent --show-error --connect-timeout 5 --max-time 5 -L)
+CURL_ASSET_OPTS=(--fail --silent --show-error --connect-timeout 5 --max-time 20 -L)
 JQ_URLS='.response.data[]?.url // empty'
 JQ_NEXT='.response.message // empty'
 
@@ -71,7 +72,7 @@ fetch_batch_to() {
   log "Fetch: $url"
 
   local json
-  if ! json="$(curl "${CURL_OPTS[@]}" "${curl_headers[@]}" "$url")"; then
+  if ! json="$(curl "${CURL_API_OPTS[@]}" "${curl_headers[@]}" "$url")"; then
     log "WARN: fetch failed"
     return 1
   fi
@@ -112,7 +113,7 @@ cache_asset() {
     return 0
   fi
 
-  if curl "${CURL_OPTS[@]}" "${curl_headers[@]}" -o "$tmp" "$url"; then
+  if curl "${CURL_ASSET_OPTS[@]}" "${curl_headers[@]}" -o "$tmp" "$url"; then
     mv "$tmp" "$path"
     echo "$path"
   else
