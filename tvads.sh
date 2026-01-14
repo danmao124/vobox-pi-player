@@ -22,6 +22,7 @@ source "$CONFIG"
 
 IMAGE_SECONDS="${IMAGE_SECONDS:-15}"
 RESTART_HOURS="${RESTART_HOURS:-24}"
+MAX_CACHE_MB="${MAX_CACHE_MB:-30000}" # 30GB
 RESTART_SECONDS=$((RESTART_HOURS*60*60))
 
 VIEW_PATH="view/billboard"
@@ -31,7 +32,7 @@ JQ_URLS='.response.data[]?.url // empty'
 JQ_NEXT='.response.message // empty'
 
 MPV_COMMON=(--fs --no-border --really-quiet --keep-open=no --hwdec=auto --mute=yes --volume=0)
-MPV_IMG=(--image-display-duration="${IMAGE_SECONDS}" --loop-file=inf)
+MPV_IMG=(--image-display-duration="${IMAGE_SECONDS}")
 
 log(){ echo "[$(date '+%F %T')] $*"; }
 
@@ -139,12 +140,35 @@ background_fetch_pending() {
   fi
 }
 
+cleanup_cache() {
+  local used_mb
+  used_mb=$(du -sm "$ASSET_DIR" | awk '{print $1}')
+
+  if (( used_mb <= MAX_CACHE_MB )); then
+    return
+  fi
+
+  log "Cache cleanup: ${used_mb}MB used, trimming to ${MAX_CACHE_MB}MB"
+
+  # Delete oldest files first
+  find "$ASSET_DIR" -type f -printf '%T@ %p\n' \
+    | sort -n \
+    | while read -r _ file; do
+        rm -f "$file"
+        used_mb=$(du -sm "$ASSET_DIR" | awk '{print $1}')
+        (( used_mb <= MAX_CACHE_MB )) && break
+      done
+}
+
 swap_pending_if_any() {
   if [[ -s "$PENDING_LIST" ]]; then
     log "Swap: pending -> main"
     mv "$PENDING_LIST" "$MAIN_LIST"
     : > "$PENDING_LIST" || true
   fi
+
+  cleanup_cache    
+
   # always fetch next in background
   background_fetch_pending & disown || true
 }
