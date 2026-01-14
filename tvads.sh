@@ -224,13 +224,16 @@ mpv_wait_until_eof() {
 }
 
 mpv_wait_until_playback_starts() {
-  # Wait until playback-time becomes >= 0 (more reliable than idle-active on some builds)
-  for _ in {1..100}; do
-    mpv_get_prop "playback-time" | grep -q '"data":' && return 0
+  for _ in {1..150}; do
+    # accept numeric playback-time only (reject null)
+    if mpv_get_prop "playback-time" | grep -Eq '"data":[ ]*[0-9]'; then
+      return 0
+    fi
     sleep 0.1
   done
   return 1
 }
+
 
 mpv_set_prop() {
   local prop="$1" val="$2"
@@ -246,13 +249,13 @@ play_url() {
 
   if is_video "$url"; then
     mpv_set_prop "keep-open" "no"
+    mpv_set_prop "eof-reached" "no" || true   # reset BEFORE load
   else
     mpv_set_prop "keep-open" "always"
   fi
 
   mpv_send "{\"command\":[\"loadfile\",\"$src\",\"replace\"]}"
 
-  # more robust “started” check
   if ! mpv_wait_until_playback_starts; then
     log "WARN: playback did not start, skipping: $url"
     return 0
@@ -260,12 +263,11 @@ play_url() {
 
   if is_video "$url"; then
     mpv_wait_until_eof
-    # reset eof flag for next load (mpv usually resets, but this avoids edge cases)
-    mpv_set_prop "eof-reached" "no" || true
   else
     sleep "$IMAGE_SECONDS"
   fi
 }
+
 
 main() {
   ensure_dirs
