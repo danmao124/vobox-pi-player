@@ -196,7 +196,7 @@ start_mpv_if_needed() {
       --mute=yes --volume=0 \
       --idle=yes --force-window=yes \
       --no-osc --cursor-autohide=always \
-      --keep-open=always --vo=gpu-next \
+      --keep-open=always \
       --input-ipc-server="$MPV_SOCK" \
       >/dev/null 2>&1 &
 
