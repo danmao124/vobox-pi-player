@@ -196,7 +196,7 @@ start_mpv_if_needed() {
       --mute=yes --volume=0 \
       --idle=yes --force-window=yes \
       --no-osc --cursor-autohide=always \
-      --keep-open=always \
+      --keep-open=always --vo=gpu-next \
       --input-ipc-server="$MPV_SOCK" \
       >/dev/null 2>&1 &
 
@@ -253,8 +253,8 @@ play_url() {
     mpv_wait_until_idle
   else
     # images don't end -> we control timing then stop
-    sleep "$IMAGE_SECONDS"
-    return 0
+    mpv_send '{"command":["stop"]}'
+    mpv_wait_until_idle
   fi
 }
 
