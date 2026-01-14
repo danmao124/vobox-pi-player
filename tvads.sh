@@ -2,7 +2,7 @@
 set -euo pipefail
 
 CONFIG="/data/player/config.env"
-STATE_DIR="/data/player/state"
+STATE_DIR="/tmp/player/state"
 ASSET_DIR="/data/assets"
 
 MAIN_LIST="${STATE_DIR}/main.txt"
