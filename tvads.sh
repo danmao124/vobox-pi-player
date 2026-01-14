@@ -15,6 +15,16 @@ VIEW_PATH="view/billboard"
 # mpv IPC socket (lives in RAM; fine)
 MPV_SOCK="/tmp/venditt-mpv.sock"
 
+cleanup() {
+  # ask mpv to quit nicely; then hard kill if needed
+  if [[ -S "$MPV_SOCK" ]]; then
+    printf '%s\n' '{"command":["quit"]}' | socat - UNIX-CONNECT:"$MPV_SOCK" >/dev/null 2>&1 || true
+  fi
+  pkill -f "input-ipc-server=$MPV_SOCK" >/dev/null 2>&1 || true
+  rm -f "$MPV_SOCK" >/dev/null 2>&1 || true
+}
+trap cleanup EXIT INT TERM
+
 # ---------- load config ----------
 if [[ ! -f "$CONFIG" ]]; then
   echo "Missing config: $CONFIG"
@@ -169,7 +179,13 @@ mpv_get_idle() {
 
 start_mpv_if_needed() {
   if [[ -S "$MPV_SOCK" ]]; then
-    return 0
+    if ! mpv_query '{"command":["get_property","idle-active"]}' | grep -q '"data"'; then
+      log "Stale mpv socket detected; restarting mpv"
+      pkill -f "input-ipc-server=$MPV_SOCK" >/dev/null 2>&1 || true
+      rm -f "$MPV_SOCK" || true
+    else
+      return 0
+    fi
   fi
 
   rm -f "$MPV_SOCK" || true
