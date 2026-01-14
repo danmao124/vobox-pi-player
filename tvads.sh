@@ -210,26 +210,26 @@ start_mpv_if_needed() {
   return 1
 }
 
-mpv_wait_until_not_idle() {
-  # Wait until playback actually starts (idle-active becomes false).
-  # Prevents instant "finished" on load failure.
+mpv_get_prop() {
+  local prop="$1"
+  mpv_query "{\"command\":[\"get_property\",\"$prop\"]}"
+}
+
+mpv_wait_until_eof() {
+  # eof-reached becomes true when file ends
+  while true; do
+    mpv_get_prop "eof-reached" | grep -q '"data":true' && return 0
+    sleep 0.2
+  done
+}
+
+mpv_wait_until_playback_starts() {
+  # Wait until playback-time becomes >= 0 (more reliable than idle-active on some builds)
   for _ in {1..100}; do
-    if ! mpv_get_idle; then
-      return 0
-    fi
+    mpv_get_prop "playback-time" | grep -q '"data":' && return 0
     sleep 0.1
   done
   return 1
-}
-
-mpv_wait_until_idle() {
-  # Wait until playback ends (idle-active becomes true again)
-  while true; do
-    if mpv_get_idle; then
-      return 0
-    fi
-    sleep 0.25
-  done
 }
 
 mpv_set_prop() {
@@ -245,25 +245,25 @@ play_url() {
   start_mpv_if_needed
 
   if is_video "$url"; then
-    # videos should end naturally and return to idle
     mpv_set_prop "keep-open" "no"
   else
-    # images: keep last frame up (no black flash)
     mpv_set_prop "keep-open" "always"
   fi
 
   mpv_send "{\"command\":[\"loadfile\",\"$src\",\"replace\"]}"
 
-  if ! mpv_wait_until_not_idle; then
+  # more robust “started” check
+  if ! mpv_wait_until_playback_starts; then
     log "WARN: playback did not start, skipping: $url"
     return 0
   fi
 
   if is_video "$url"; then
-    mpv_wait_until_idle
+    mpv_wait_until_eof
+    # reset eof flag for next load (mpv usually resets, but this avoids edge cases)
+    mpv_set_prop "eof-reached" "no" || true
   else
     sleep "$IMAGE_SECONDS"
-    # don't stop; next loadfile will replace seamlessly
   fi
 }
 
