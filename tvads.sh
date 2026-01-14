@@ -8,6 +8,8 @@ ASSET_DIR="/data/assets"
 MAIN_LIST="${STATE_DIR}/main.txt"
 PENDING_LIST="${STATE_DIR}/pending.txt"
 INDEX_FILE="${STATE_DIR}/index.txt"
+NEXT_FILE="${STATE_DIR}/next.txt"
+MPV_PLAYLIST="${STATE_DIR}/mpv.m3u"
 
 # ---------- load config ----------
 if [[ ! -f "$CONFIG" ]]; then
@@ -31,20 +33,21 @@ CURL_OPTS=(--fail --silent --show-error --connect-timeout 5 --max-time 20 -L)
 JQ_URLS='.response.data[]?.url // empty'
 JQ_NEXT='.response.message // empty'
 
-MPV_COMMON=(--fs --no-border --really-quiet --keep-open=no --hwdec=auto --mute=yes --volume=0)
-MPV_IMG=(--image-display-duration="${IMAGE_SECONDS}")
+# mpv: one instance plays a whole playlist (no terminal flashes)
+MPV_OPTS=(
+  --fs --no-border --really-quiet
+  --hwdec=auto
+  --mute=yes --volume=0
+  --image-display-duration="${IMAGE_SECONDS}"
+  --keep-open=no
+)
 
 log(){ echo "[$(date '+%F %T')] $*"; }
-
-is_video() {
-  local u="${1,,}"
-  [[ "$u" == *".mp4"* || "$u" == *".webm"* ]]
-}
 
 ensure_dirs() {
   mkdir -p "$STATE_DIR" "$ASSET_DIR"
   [[ -f "$INDEX_FILE" ]] || echo "0" > "$INDEX_FILE"
-  [[ -f "$MAIN_LIST" ]] || : > "$MAIN_LIST"
+  [[ -f "$MAIN_LIST"  ]] || : > "$MAIN_LIST"
   [[ -f "$PENDING_LIST" ]] || : > "$PENDING_LIST"
 }
 
@@ -115,28 +118,13 @@ cache_asset() {
   fi
 }
 
-play_one() {
-  local url="$1"
-  local src
-  src="$(cache_asset "$url")"
-
-  if is_video "$url"; then
-    log "PLAY video: $url"
-    mpv "${MPV_COMMON[@]}" "$src" || log "WARN: mpv video failed"
-  else
-    log "SHOW image ${IMAGE_SECONDS}s: $url"
-    mpv "${MPV_COMMON[@]}" "${MPV_IMG[@]}" "$src" || log "WARN: mpv image failed"
-  fi
-}
-
 background_fetch_pending() {
   local idx
   idx="$(cat "$INDEX_FILE" 2>/dev/null || echo "0")"
-  local nextfile="${STATE_DIR}/next.txt"
-  if fetch_batch_to "$idx" "$PENDING_LIST" "$nextfile"; then
-    mv "$nextfile" "$INDEX_FILE"
+  if fetch_batch_to "$idx" "$PENDING_LIST" "$NEXT_FILE"; then
+    mv "$NEXT_FILE" "$INDEX_FILE"
   else
-    rm -f "$nextfile" || true
+    rm -f "$NEXT_FILE" || true
   fi
 }
 
@@ -167,30 +155,51 @@ swap_pending_if_any() {
     : > "$PENDING_LIST" || true
   fi
 
-  cleanup_cache    
+  cleanup_cache
 
   # always fetch next in background
   background_fetch_pending & disown || true
+}
+
+build_mpv_playlist_from_main() {
+  : > "$MPV_PLAYLIST"
+  while IFS= read -r url; do
+    [[ -n "$url" ]] || continue
+    echo "$(cache_asset "$url")" >> "$MPV_PLAYLIST"
+  done < "$MAIN_LIST"
+}
+
+run_batch_playlist_once() {
+  build_mpv_playlist_from_main
+  local n
+  n="$(wc -l < "$MPV_PLAYLIST" | tr -d ' ')"
+  if [[ "$n" == "0" ]]; then
+    log "WARN: mpv playlist empty; skipping"
+    return 1
+  fi
+
+  log "mpv playing batch ($n items)"
+  mpv "${MPV_OPTS[@]}" --playlist="$MPV_PLAYLIST" || true
+  return 0
 }
 
 main() {
   ensure_dirs
 
   # initial main fetch
-  local idx nextfile
+  local idx
   idx="$(cat "$INDEX_FILE" 2>/dev/null || echo "0")"
-  nextfile="${STATE_DIR}/next.txt"
-  until fetch_batch_to "$idx" "$MAIN_LIST" "$nextfile"; do
+  until fetch_batch_to "$idx" "$MAIN_LIST" "$NEXT_FILE"; do
     log "Retry initial fetch in 5s..."
     sleep 5
     idx="$(cat "$INDEX_FILE" 2>/dev/null || echo "0")"
   done
-  mv "$nextfile" "$INDEX_FILE"
+  mv "$NEXT_FILE" "$INDEX_FILE"
 
   # fetch next batch in background
   background_fetch_pending & disown || true
 
-  local start_ts now total i url
+  local start_ts now
   start_ts="$(date +%s)"
 
   while true; do
@@ -203,22 +212,15 @@ main() {
     if [[ ! -s "$MAIN_LIST" ]]; then
       log "WARN: main list empty; refetching..."
       idx="$(cat "$INDEX_FILE" 2>/dev/null || echo "0")"
-      fetch_batch_to "$idx" "$MAIN_LIST" "$nextfile" && mv "$nextfile" "$INDEX_FILE" || sleep 2
+      fetch_batch_to "$idx" "$MAIN_LIST" "$NEXT_FILE" && mv "$NEXT_FILE" "$INDEX_FILE" || sleep 2
       continue
     fi
 
-    total="$(wc -l < "$MAIN_LIST" | tr -d ' ')"
-    i=0
+    # Play current batch with a single mpv invocation (no terminal flashes)
+    run_batch_playlist_once || sleep 1
 
-    while IFS= read -r url; do
-      [[ -n "$url" ]] || continue
-      play_one "$url"
-      i=$((i+1))
-      if (( i >= total )); then
-        # wrap point: swap to pending like your Angular nextIndex==0 behavior
-        swap_pending_if_any
-      fi
-    done < "$MAIN_LIST"
+    # When batch finishes, swap pending and prepare next
+    swap_pending_if_any
   done
 }
 
