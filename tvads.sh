@@ -23,9 +23,7 @@ source "$CONFIG"
 : "${ID:?Missing ID in config.env}"
 
 IMAGE_SECONDS="${IMAGE_SECONDS:-15}"
-RESTART_HOURS="${RESTART_HOURS:-24}"
 MAX_CACHE_MB="${MAX_CACHE_MB:-30000}" # 30GB
-RESTART_SECONDS=$((RESTART_HOURS*60*60))
 
 VIEW_PATH="view/billboard"
 
@@ -199,16 +197,7 @@ main() {
   # fetch next batch in background
   background_fetch_pending & disown || true
 
-  local start_ts now
-  start_ts="$(date +%s)"
-
   while true; do
-    now="$(date +%s)"
-    if (( now - start_ts >= RESTART_SECONDS )); then
-      log "Restart window hit (${RESTART_HOURS}h). Exiting for supervisor restart."
-      exit 0
-    fi
-
     if [[ ! -s "$MAIN_LIST" ]]; then
       log "WARN: main list empty; refetching..."
       idx="$(cat "$INDEX_FILE" 2>/dev/null || echo "0")"
