@@ -196,7 +196,7 @@ start_mpv_if_needed() {
       --mute=yes --volume=0 \
       --idle=yes --force-window=yes \
       --no-osc --cursor-autohide=always \
-      --keep-open=always --vo=gpu-next \
+      --vo=gpu-next \
       --input-ipc-server="$MPV_SOCK" \
       >/dev/null 2>&1 &
 
@@ -232,12 +232,26 @@ mpv_wait_until_idle() {
   done
 }
 
+mpv_set_prop() {
+  local prop="$1" val="$2"
+  mpv_send "{\"command\":[\"set_property\",\"$prop\",\"$val\"]}"
+}
+
 play_url() {
   local url="$1"
   local src
   src="$(cache_asset "$url")"
 
   start_mpv_if_needed
+
+  if is_video "$url"; then
+    # videos should end naturally and return to idle
+    mpv_set_prop "keep-open" "no"
+  else
+    # images: keep last frame up (no black flash)
+    mpv_set_prop "keep-open" "always"
+  fi
+
   mpv_send "{\"command\":[\"loadfile\",\"$src\",\"replace\"]}"
 
   if ! mpv_wait_until_not_idle; then
@@ -249,7 +263,7 @@ play_url() {
     mpv_wait_until_idle
   else
     sleep "$IMAGE_SECONDS"
-    # don't stop; don't wait idle
+    # don't stop; next loadfile will replace seamlessly
   fi
 }
 
