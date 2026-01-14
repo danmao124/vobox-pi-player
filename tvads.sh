@@ -211,13 +211,31 @@ mpv_get_prop() {
   mpv_query "{\"command\":[\"get_property\",\"$prop\"]}"
 }
 
-mpv_wait_until_eof() {
-  # eof-reached becomes true when file ends
+mpv_get_duration_secs() {
+  # Returns duration as an integer seconds, or empty if unknown.
+  local r
+  r="$(mpv_get_prop "duration")"
+  # match "data":123.456
+  echo "$r" | sed -nE 's/.*"data":[ ]*([0-9]+)(\.[0-9]+)?.*/\1/p'
+}
+
+mpv_wait_until_eof_with_timeout() {
+  local timeout_secs="$1"
+  local ticks=0
+  local max_ticks=$((timeout_secs * 5))  # 0.2s ticks => *5
+
   while true; do
     mpv_get_prop "eof-reached" | grep -q '"data":true' && return 0
     sleep 0.2
+    ticks=$((ticks+1))
+    if (( ticks >= max_ticks )); then
+      log "WARN: eof timeout after ${timeout_secs}s; skipping"
+      mpv_send '{"command":["stop"]}'
+      return 0
+    fi
   done
 }
+
 
 mpv_wait_until_playback_starts() {
   for _ in {1..150}; do
@@ -254,11 +272,18 @@ play_url() {
   fi
 
   if is_video "$url"; then
-    mpv_wait_until_eof
-    # do NOT stop; keep-open holds last frame until next loadfile
+    local dur
+    dur="$(mpv_get_duration_secs || true)"
+
+    if [[ -n "$dur" && "$dur" -gt 0 ]]; then
+      # duration + 30s buffer (network/decoder hiccups)
+      mpv_wait_until_eof_with_timeout $((dur + 30))
+    else
+      # unknown duration: allow up to 5 minutes, then bail
+      mpv_wait_until_eof_with_timeout $((5 * 60))
+    fi
   else
     sleep "$IMAGE_SECONDS"
-    # do NOT stop; next loadfile replaces seamlessly
   fi
 }
 
