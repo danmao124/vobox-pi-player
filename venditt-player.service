@@ -1,0 +1,28 @@
+[Unit]
+Description=Venditt Player (mpv signage)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=vobox
+Group=vobox
+SupplementaryGroups=video render audio input
+
+WorkingDirectory=/data/player
+
+# Prevent double-starts
+ExecStart=/usr/bin/flock -n /run/venditt-player.lock /data/player/player.sh
+
+Restart=always
+RestartSec=1
+StartLimitIntervalSec=0
+
+KillMode=control-group
+TimeoutStopSec=10
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
