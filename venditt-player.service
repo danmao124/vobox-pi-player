@@ -16,7 +16,7 @@ RuntimeDirectory=venditt-player
 RuntimeDirectoryMode=0755
 
 # Prevent double-starts (lock lives in the runtime dir)
-ExecStart=/usr/bin/flock -n /run/venditt-player/lock /data/player/player.sh
+ExecStart=/usr/bin/flock -n /run/venditt-player/lock /data/player/tvads.sh
 
 Restart=always
 RestartSec=1
