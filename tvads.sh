@@ -265,7 +265,6 @@ play_url() {
   log "DBG: want_src=$(printf '%q' "$src") mpv_path=$(mpv_get_prop_data path) mpv_filename=$(mpv_get_prop_data filename)"
 
   if is_video "$url"; then
-    log "VIDEO: $(printf '%q' "$url")"
     local dur
     dur="$(mpv_get_duration_secs || true)"
     if [[ -n "$dur" && "$dur" -gt 0 ]]; then
@@ -274,7 +273,6 @@ play_url() {
       mpv_wait_until_eof_with_timeout $((5 * 60))
     fi
   else
-    log "IMAGE: $(printf '%q' "$url")"
     sleep "$IMAGE_SECONDS"
   fi
 }
