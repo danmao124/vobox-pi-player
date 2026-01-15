@@ -1,26 +1,30 @@
 [Unit]
 Description=Venditt Player (mpv signage)
-After=network-online.target ssh.service
-Wants=network-online.target ssh.service
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
 User=vobox
 Group=vobox
 SupplementaryGroups=video render audio input
-
 WorkingDirectory=/data/player
 
-# Start your real script
+# Give you a local window to log in before mpv takes over
+ExecStartPre=/bin/sleep 15
+
+# Pin the player to tty1 so tty2+ stays usable for admin login
+TTYPath=/dev/tty1
+StandardInput=tty
+
 ExecStart=/data/player/tvads.sh
 
-# Auto-restart on crashes
 Restart=always
 RestartSec=2
 StartLimitIntervalSec=0
 
 KillMode=control-group
-TimeoutStopSec=25
+TimeoutStopSec=10
 
 StandardOutput=journal
 StandardError=journal
