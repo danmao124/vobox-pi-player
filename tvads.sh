@@ -97,9 +97,9 @@ cache_path_for_url() {
   if [[ "$url" =~ \.([A-Za-z0-9]{2,5})(\?|$) ]]; then
     ext=".${BASH_REMATCH[1]}"
   fi
-  local hash
-  hash="$(printf "%s" "$url" | sha256sum | awk '{print $1}')"
-  echo "${ASSET_DIR}/${hash}${ext}"
+  local filename
+  filename="${url##*/}"
+  echo "${ASSET_DIR}/${filename}${ext}"
 }
 
 cache_asset() {
