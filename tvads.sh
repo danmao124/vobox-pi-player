@@ -190,7 +190,6 @@ start_mpv_if_needed() {
     --keep-open=always --keep-open-pause=no \
     --vo=gpu \
     --reset-on-next-file=no \
-    --image-display-duration="$IMAGE_SECONDS" \
     --input-ipc-server="$MPV_SOCK" \
     >/dev/null 2>&1 &
 
@@ -232,13 +231,30 @@ mpv_wait_until_eof_with_timeout() {
   done
 }
 
-# FIXED: time-pos works reliably for both images + videos
 mpv_wait_until_playback_starts() {
   for _ in {1..150}; do
     if mpv_get_prop "time-pos" | grep -Eq '"data":[ ]*[0-9]'; then
       return 0
     fi
     sleep 0.1
+  done
+  return 1
+}
+
+mpv_get_prop_data() {
+  local prop="$1"
+  mpv_get_prop "$prop" | sed -nE 's/.*"data":[ ]*"?([^"}]*)"?[,}].*/\1/p'
+}
+
+mpv_wait_until_path_is() {
+  local expected="$1"
+  local tries=0
+  while (( tries < 200 )); do # 200 * 0.05s = 10s
+    local p
+    p="$(mpv_get_prop_data "path")"
+    [[ "$p" == "$expected" ]] && return 0
+    sleep 0.05
+    tries=$((tries+1))
   done
   return 1
 }
@@ -251,18 +267,16 @@ play_url() {
   start_mpv_if_needed
 
   if is_video "$url"; then
-    # videos should play normally
     mpv_send '{"command":["set_property","loop-file","no"]}'
   else
-    # images: force them to stay up (no EOF), we control duration with sleep
     mpv_send '{"command":["set_property","loop-file","inf"]}'
   fi
 
   mpv_send "{\"command\":[\"loadfile\",\"$src\",\"replace\"]}"
 
-  # wait until mpv actually has the new file loaded/started
-  if ! mpv_wait_until_playback_starts; then
-    log "WARN: playback did not start, skipping: $url"
+  # IMPORTANT: wait until mpv actually switched to THIS file
+  if ! mpv_wait_until_path_is "$src"; then
+    log "WARN: mpv did not load expected path, skipping: $url"
     return 0
   fi
 
@@ -270,7 +284,6 @@ play_url() {
     log "VIDEO: $(printf '%q' "$url")"
     local dur
     dur="$(mpv_get_duration_secs || true)"
-
     if [[ -n "$dur" && "$dur" -gt 0 ]]; then
       mpv_wait_until_eof_with_timeout $((dur + 10))
     else
@@ -281,7 +294,6 @@ play_url() {
     sleep "$IMAGE_SECONDS"
   fi
 }
-
 
 main() {
   ensure_dirs
