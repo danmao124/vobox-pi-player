@@ -11,8 +11,12 @@ SupplementaryGroups=video render audio input
 
 WorkingDirectory=/data/player
 
-# Prevent double-starts
-ExecStart=/usr/bin/flock -n /run/venditt-player.lock /data/player/player.sh
+# Create a writable /run/venditt-player/ directory for this service
+RuntimeDirectory=venditt-player
+RuntimeDirectoryMode=0755
+
+# Prevent double-starts (lock lives in the runtime dir)
+ExecStart=/usr/bin/flock -n /run/venditt-player/lock /data/player/player.sh
 
 Restart=always
 RestartSec=1
