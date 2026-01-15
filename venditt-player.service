@@ -1,28 +1,23 @@
 [Unit]
 Description=Venditt Player (mpv signage)
-After=network-online.target
-Wants=network-online.target
-
-# rate-limit restart storms
-StartLimitIntervalSec=0
+After=network-online.target ssh.service
+Wants=network-online.target ssh.service
 
 [Service]
 Type=simple
 User=vobox
 Group=vobox
 SupplementaryGroups=video render audio input
+
 WorkingDirectory=/data/player
 
-# Give local admin a window before mpv takes over
-# ExecStartPre=/bin/sleep 15
-
-# IMPORTANT: must be > ExecStartPre sleep, with margin
-TimeoutStartSec=60
-
+# Start your real script
 ExecStart=/data/player/tvads.sh
 
+# Auto-restart on crashes
 Restart=always
 RestartSec=2
+StartLimitIntervalSec=0
 
 KillMode=control-group
 TimeoutStopSec=10
