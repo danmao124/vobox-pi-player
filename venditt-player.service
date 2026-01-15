@@ -4,6 +4,7 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
+TimeoutStartSec=120
 Type=simple
 User=vobox
 Group=vobox
