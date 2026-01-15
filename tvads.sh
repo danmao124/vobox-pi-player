@@ -190,6 +190,7 @@ start_mpv_if_needed() {
     --no-osc --cursor-autohide=always \
     --keep-open=always --keep-open-pause=no \
     --vo=gpu \
+    --reset-on-next-file=no \
     --image-display-duration="$IMAGE_SECONDS" \
     --input-ipc-server="$MPV_SOCK" \
     >/dev/null 2>&1 &
@@ -250,10 +251,7 @@ play_url() {
 
   start_mpv_if_needed
 
-  # FIXED: reset state before every item (prevents image flash -> video)
-  mpv_send '{"command":["stop"]}'
   mpv_send '{"command":["set_property","time-pos",0]}'
-
   mpv_send "{\"command\":[\"loadfile\",\"$src\",\"replace\"]}"
 
   if ! mpv_wait_until_playback_starts; then
