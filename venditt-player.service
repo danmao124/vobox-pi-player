@@ -12,7 +12,7 @@ SupplementaryGroups=video render audio input
 WorkingDirectory=/data/player
 
 # Start your real script
-ExecStart=/data/player/tvads.sh
+ExecStart=/usr/bin/bash /data/player/tvads.sh
 
 # Auto-restart on crashes
 Restart=always
