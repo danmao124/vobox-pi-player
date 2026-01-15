@@ -193,6 +193,7 @@ start_mpv_if_needed() {
     --no-osc --cursor-autohide=always \
     --keep-open=always --keep-open-pause=no \
     --vo=gpu \
+    --image-display-duration="$IMAGE_SECONDS" \
     --input-ipc-server="$MPV_SOCK" \
     >/dev/null 2>&1 &
 
@@ -285,7 +286,7 @@ play_url() {
     fi
   else
     log "IMAGE: $(printf '%q' "$url")"
-    sleep "$IMAGE_SECONDS"
+    mpv_wait_until_eof_with_timeout $((IMAGE_SECONDS + 5))
   fi
 }
 
