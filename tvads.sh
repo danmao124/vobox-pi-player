@@ -272,6 +272,7 @@ play_url() {
   fi
 
   if is_video "$url"; then
+    log "VIDEO: $(printf '%q' "$url")"
     local dur
     dur="$(mpv_get_duration_secs || true)"
 
@@ -283,6 +284,7 @@ play_url() {
       mpv_wait_until_eof_with_timeout $((5 * 60))
     fi
   else
+    log "IMAGE: $(printf '%q' "$url")"
     sleep "$IMAGE_SECONDS"
   fi
 }
@@ -319,7 +321,6 @@ main() {
 
     while IFS= read -r url; do
       [[ -n "$url" ]] || continue
-      log "RAW URL: $(printf '%q' "$url")"
       play_url "$url"
     done < "$MAIN_LIST"
 
