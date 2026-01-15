@@ -46,6 +46,14 @@ JQ_NEXT='.response.message // empty'
 
 log(){ echo "[$(date '+%F %T')] $*"; }
 
+# Strip CRLF, trailing whitespace, and trailing commas from URLs
+normalize_url() {
+  local u="$1"
+  u="${u//$'\r'/}"
+  u="$(sed -E 's/[[:space:]]+$//; s/,+$//' <<<"$u")"
+  printf '%s' "$u"
+}
+
 is_video() {
   local u="${1,,}"
   [[ "$u" == *".mp4"* || "$u" == *".webm"* || "$u" == *".m4v"* || "$u" == *".mov"* || "$u" == *".mkv"* ]]
@@ -78,7 +86,9 @@ fetch_batch_to() {
   fi
 
   local urls next
-  urls="$(jq -r "$JQ_URLS" <<<"$json" | sed '/^$/d' || true)"
+  # normalize lines coming from API (fixes "a.png," and CRLF issues)
+  urls="$(jq -r "$JQ_URLS" <<<"$json" \
+    | sed -E 's/\r$//; s/[[:space:]]+$//; s/,+$//; /^$/d' || true)"
   next="$(jq -r "$JQ_NEXT" <<<"$json" | sed '/^$/d' || true)"
 
   if [[ -z "$urls" ]]; then
@@ -208,6 +218,11 @@ mpv_get_prop() {
   mpv_query "{\"command\":[\"get_property\",\"$prop\"]}"
 }
 
+mpv_get_prop_data() {
+  local prop="$1"
+  mpv_get_prop "$prop" | sed -nE 's/.*"data":[ ]*"?([^"}]*)"?[,}].*/\1/p'
+}
+
 mpv_get_duration_secs() {
   local r
   r="$(mpv_get_prop "duration")"
@@ -231,37 +246,9 @@ mpv_wait_until_eof_with_timeout() {
   done
 }
 
-mpv_wait_until_playback_starts() {
-  for _ in {1..150}; do
-    if mpv_get_prop "time-pos" | grep -Eq '"data":[ ]*[0-9]'; then
-      return 0
-    fi
-    sleep 0.1
-  done
-  return 1
-}
-
-mpv_get_prop_data() {
-  local prop="$1"
-  mpv_get_prop "$prop" | sed -nE 's/.*"data":[ ]*"?([^"}]*)"?[,}].*/\1/p'
-}
-
-mpv_wait_until_path_is() {
-  local expected="$1"
-  local tries=0
-  while (( tries < 200 )); do # 200 * 0.05s = 10s
-    local p
-    p="$(mpv_get_prop_data "path")"
-    [[ "$p" == "$expected" ]] && return 0
-    sleep 0.05
-    tries=$((tries+1))
-  done
-  return 1
-}
-
 play_url() {
-  local url="$1"
-  local src
+  local url src
+  url="$(normalize_url "$1")"
   src="$(cache_asset "$url")"
 
   start_mpv_if_needed
@@ -274,11 +261,8 @@ play_url() {
 
   mpv_send "{\"command\":[\"loadfile\",\"$src\",\"replace\"]}"
 
-  # IMPORTANT: wait until mpv actually switched to THIS file
-  if ! mpv_wait_until_path_is "$src"; then
-    log "WARN: mpv did not load expected path, skipping: $url"
-    return 0
-  fi
+  # DEBUG: what mpv actually thinks it loaded (key for diagnosing flash-skip)
+  log "DBG: want_src=$(printf '%q' "$src") mpv_path=$(mpv_get_prop_data path) mpv_filename=$(mpv_get_prop_data filename)"
 
   if is_video "$url"; then
     log "VIDEO: $(printf '%q' "$url")"
@@ -324,6 +308,7 @@ main() {
     log "Playing batch ($n items)"
 
     while IFS= read -r url; do
+      url="$(normalize_url "$url")"
       [[ -n "$url" ]] || continue
       play_url "$url"
     done < "$MAIN_LIST"
