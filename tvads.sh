@@ -38,6 +38,7 @@ source "$CONFIG"
 
 IMAGE_SECONDS="${IMAGE_SECONDS:-15}"
 MAX_CACHE_MB="${MAX_CACHE_MB:-30000}" # 30GB
+ORIENTATION="${ORIENTATION:-0}"  # Screen orientation: 0, 90, 180, or 270
 
 CURL_API_OPTS=(--fail --silent --show-error --connect-timeout 5 --max-time 10 -L)
 CURL_ASSET_OPTS=(--fail --silent --show-error --connect-timeout 5 --max-time 20 -L)
@@ -190,7 +191,7 @@ start_mpv_if_needed() {
   fi
 
   rm -f "$MPV_SOCK" || true
-  log "Starting mpv (persistent fullscreen, IPC)"
+  log "Starting mpv (persistent fullscreen, IPC, rotation=${ORIENTATION}°)"
 
   mpv --fs --no-border --really-quiet \
     --hwdec=auto \
@@ -200,6 +201,7 @@ start_mpv_if_needed() {
     --keep-open=always --keep-open-pause=no \
     --vo=gpu \
     --reset-on-next-file=no \
+    --video-rotate="$ORIENTATION" \
     --input-ipc-server="$MPV_SOCK" \
     >/dev/null 2>&1 &
 
