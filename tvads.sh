@@ -91,15 +91,12 @@ fetch_batch_to() {
   log "OK: $(wc -l < "$out" | tr -d ' ') assets, nextIndex=$(cat "$nextfile")"
 }
 
+# FIXED: strip querystrings; don't double-append extensions
 cache_path_for_url() {
   local url="$1"
-  local ext=""
-  if [[ "$url" =~ \.([A-Za-z0-9]{2,5})(\?|$) ]]; then
-    ext=".${BASH_REMATCH[1]}"
-  fi
-  local filename
-  filename="${url##*/}"
-  echo "${ASSET_DIR}/${filename}${ext}"
+  local base="${url%%\?*}"      # strip query
+  local filename="${base##*/}"  # final path segment
+  echo "${ASSET_DIR}/${filename}"
 }
 
 cache_asset() {
@@ -213,10 +210,8 @@ mpv_get_prop() {
 }
 
 mpv_get_duration_secs() {
-  # Returns duration as an integer seconds, or empty if unknown.
   local r
   r="$(mpv_get_prop "duration")"
-  # match "data":123.456
   echo "$r" | sed -nE 's/.*"data":[ ]*([0-9]+)(\.[0-9]+)?.*/\1/p'
 }
 
@@ -237,21 +232,15 @@ mpv_wait_until_eof_with_timeout() {
   done
 }
 
-
+# FIXED: time-pos works reliably for both images + videos
 mpv_wait_until_playback_starts() {
   for _ in {1..150}; do
-    # accept numeric playback-time only (reject null)
-    if mpv_get_prop "playback-time" | grep -Eq '"data":[ ]*[0-9]'; then
+    if mpv_get_prop "time-pos" | grep -Eq '"data":[ ]*[0-9]'; then
       return 0
     fi
     sleep 0.1
   done
   return 1
-}
-
-mpv_set_prop() {
-  local prop="$1" val="$2"
-  mpv_send "{\"command\":[\"set_property\",\"$prop\",\"$val\"]}"
 }
 
 play_url() {
@@ -261,9 +250,9 @@ play_url() {
 
   start_mpv_if_needed
 
-  if is_video "$url"; then
-    mpv_set_prop "eof-reached" "no" || true
-  fi
+  # FIXED: reset state before every item (prevents image flash -> video)
+  mpv_send '{"command":["stop"]}'
+  mpv_send '{"command":["set_property","time-pos",0]}'
 
   mpv_send "{\"command\":[\"loadfile\",\"$src\",\"replace\"]}"
 
@@ -278,10 +267,8 @@ play_url() {
     dur="$(mpv_get_duration_secs || true)"
 
     if [[ -n "$dur" && "$dur" -gt 0 ]]; then
-      # duration + 30s buffer (network/decoder hiccups)
       mpv_wait_until_eof_with_timeout $((dur + 30))
     else
-      # unknown duration: allow up to 5 minutes, then bail
       mpv_wait_until_eof_with_timeout $((5 * 60))
     fi
   else
@@ -293,7 +280,6 @@ play_url() {
 main() {
   ensure_dirs
 
-  # initial main fetch
   local idx
   idx="$(cat "$INDEX_FILE" 2>/dev/null || echo "0")"
   until fetch_batch_to "$idx" "$MAIN_LIST" "$NEXT_FILE"; do
@@ -305,7 +291,6 @@ main() {
 
   background_fetch_pending & disown || true
 
-  # Start mpv once, forever
   start_mpv_if_needed
 
   while true; do
@@ -325,7 +310,6 @@ main() {
       play_url "$url"
     done < "$MAIN_LIST"
 
-    # end of batch -> swap pending and continue
     swap_pending_if_any
   done
 }
