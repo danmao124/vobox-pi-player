@@ -3,18 +3,23 @@ Description=Venditt Player (mpv signage)
 After=network-online.target
 Wants=network-online.target
 
+# rate-limit restart storms
+StartLimitIntervalSec=0
+
 [Service]
-TimeoutStartSec=60
 Type=simple
 User=vobox
 Group=vobox
 SupplementaryGroups=video render audio input
 WorkingDirectory=/data/player
 
-# Give you a local window to log in before mpv takes over
+# Give local admin a window before mpv takes over
 ExecStartPre=/bin/sleep 15
 
-# Pin the player to tty1 so tty2+ stays usable for admin login
+# IMPORTANT: must be > ExecStartPre sleep, with margin
+TimeoutStartSec=60
+
+# Pin to tty1 so tty2+ remains usable (when VT switching works)
 TTYPath=/dev/tty1
 StandardInput=tty
 
@@ -22,7 +27,6 @@ ExecStart=/data/player/tvads.sh
 
 Restart=always
 RestartSec=2
-StartLimitIntervalSec=0
 
 KillMode=control-group
 TimeoutStopSec=10
