@@ -14,7 +14,7 @@ SupplementaryGroups=video render audio input
 WorkingDirectory=/data/player
 
 # Give local admin a window before mpv takes over
-ExecStartPre=/bin/sleep 15
+# ExecStartPre=/bin/sleep 15
 
 # IMPORTANT: must be > ExecStartPre sleep, with margin
 TimeoutStartSec=60
