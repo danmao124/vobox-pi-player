@@ -1,7 +1,7 @@
 [Unit]
 Description=Venditt Player (mpv signage)
-After=network-online.target
-Wants=network-online.target
+After=network-online.target ssh.service
+Wants=network-online.target ssh.service
 
 [Service]
 Type=simple
@@ -11,15 +11,12 @@ SupplementaryGroups=video render audio input
 
 WorkingDirectory=/data/player
 
-# Create a writable /run/venditt-player/ directory for this service
-RuntimeDirectory=venditt-player
-RuntimeDirectoryMode=0755
+# Start your real script
+ExecStart=/data/player/tvads.sh
 
-# Prevent double-starts (lock lives in the runtime dir)
-ExecStart=/usr/bin/flock -n /run/venditt-player/lock /data/player/tvads.sh
-
+# Auto-restart on crashes
 Restart=always
-RestartSec=1
+RestartSec=2
 StartLimitIntervalSec=0
 
 KillMode=control-group
