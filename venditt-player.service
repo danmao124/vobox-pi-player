@@ -8,6 +8,8 @@ Type=simple
 User=vobox
 Group=vobox
 SupplementaryGroups=video render audio input
+ExecStartPre=/bin/sleep 15
+TimeoutStartSec=30
 
 WorkingDirectory=/data/player
 
@@ -17,10 +19,9 @@ ExecStart=/usr/bin/bash /data/player/tvads.sh
 # Auto-restart on crashes
 Restart=always
 RestartSec=2
-StartLimitIntervalSec=0
 
 KillMode=control-group
-TimeoutStopSec=10
+TimeoutStopSec=20
 
 StandardOutput=journal
 StandardError=journal
