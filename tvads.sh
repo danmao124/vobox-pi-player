@@ -91,11 +91,10 @@ fetch_batch_to() {
   log "OK: $(wc -l < "$out" | tr -d ' ') assets, nextIndex=$(cat "$nextfile")"
 }
 
-# FIXED: strip querystrings; don't double-append extensions
 cache_path_for_url() {
   local url="$1"
-  local base="${url%%\?*}"      # strip query
-  local filename="${base##*/}"  # final path segment
+  local base="${url%%\?*}"
+  local filename="${base##*/}"
   echo "${ASSET_DIR}/${filename}"
 }
 
@@ -251,9 +250,17 @@ play_url() {
 
   start_mpv_if_needed
 
-  mpv_send '{"command":["set_property","time-pos",0]}'
+  if is_video "$url"; then
+    # videos should play normally
+    mpv_send '{"command":["set_property","loop-file","no"]}'
+  else
+    # images: force them to stay up (no EOF), we control duration with sleep
+    mpv_send '{"command":["set_property","loop-file","inf"]}'
+  fi
+
   mpv_send "{\"command\":[\"loadfile\",\"$src\",\"replace\"]}"
 
+  # wait until mpv actually has the new file loaded/started
   if ! mpv_wait_until_playback_starts; then
     log "WARN: playback did not start, skipping: $url"
     return 0
@@ -265,15 +272,16 @@ play_url() {
     dur="$(mpv_get_duration_secs || true)"
 
     if [[ -n "$dur" && "$dur" -gt 0 ]]; then
-      mpv_wait_until_eof_with_timeout $((dur + 30))
+      mpv_wait_until_eof_with_timeout $((dur + 10))
     else
       mpv_wait_until_eof_with_timeout $((5 * 60))
     fi
   else
     log "IMAGE: $(printf '%q' "$url")"
-    mpv_wait_until_eof_with_timeout $((IMAGE_SECONDS + 5))
+    sleep "$IMAGE_SECONDS"
   fi
 }
+
 
 main() {
   ensure_dirs
