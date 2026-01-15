@@ -19,10 +19,6 @@ WorkingDirectory=/data/player
 # IMPORTANT: must be > ExecStartPre sleep, with margin
 TimeoutStartSec=60
 
-# Pin to tty1 so tty2+ remains usable (when VT switching works)
-TTYPath=/dev/tty1
-StandardInput=tty
-
 ExecStart=/data/player/tvads.sh
 
 Restart=always
