@@ -10,7 +10,7 @@ PENDING_LIST="${STATE_DIR}/pending.txt"
 INDEX_FILE="${STATE_DIR}/index.txt"
 NEXT_FILE="${STATE_DIR}/next.txt"
 
-VIEW_PATH="view/billboard"
+VIEW_PATH="view/billboard"asdfasasfd
 
 # mpv IPC socket (lives in RAM; fine)
 MPV_SOCK="/tmp/venditt-mpv.sock"
