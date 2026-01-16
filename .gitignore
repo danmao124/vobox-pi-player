@@ -1,6 +1,4 @@
-# config.env
-# *.env
-# venditt-player.service
+venditt-player.service
 config.env
 *.env
 
