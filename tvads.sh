@@ -116,17 +116,18 @@ cache_asset() {
   tmp="${path}.tmp"
 
   if [[ -s "$path" ]]; then
-    echo "$path"
+    printf '%s\n' "$path"
     return 0
   fi
 
   if curl "${CURL_ASSET_OPTS[@]}" "${curl_headers[@]}" -o "$tmp" "$url"; then
-    mv "$tmp" "$path"
-    echo "$path"
+    mv -f "$tmp" "$path"
+    printf '%s\n' "$path"
+    return 0
   else
-    rm -f "$tmp"
-    log "WARN: download failed, streaming: $url"
-    echo "$url"
+    rm -f "$tmp" >/dev/null 2>&1 || true
+    log "WARN: download failed: $url"
+    return 1
   fi
 }
 
@@ -251,7 +252,17 @@ mpv_wait_until_eof_with_timeout() {
 play_url() {
   local url src
   url="$(normalize_url "$1")"
-  src="$(cache_asset "$url")"
+
+  # assert URL path has an extension (dot after the last '/')
+  if [[ "${url%%\?*}" != */*.* ]]; then
+    log "WARN: no extension in path, skipping: $url"
+    return 0
+  fi
+
+  if ! src="$(cache_asset "$url")"; then
+    log "WARN: skip (cache_asset failed): $url"
+    return 0
+  fi
 
   start_mpv_if_needed
 
@@ -262,8 +273,6 @@ play_url() {
   fi
 
   mpv_send "{\"command\":[\"loadfile\",\"$src\",\"replace\"]}"
-
-  # DEBUG: what mpv actually thinks it loaded (key for diagnosing flash-skip)
   log "DBG: want_src=$(printf '%q' "$src") mpv_path=$(mpv_get_prop_data path) mpv_filename=$(mpv_get_prop_data filename)"
 
   if is_video "$url"; then
