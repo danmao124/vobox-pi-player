@@ -111,73 +111,23 @@ cache_path_for_url() {
 
 cache_asset() {
   local url="$1"
-  local base filename path tmp mime ext final
-
-  # derive base filename from URL path (strip querystring)
-  base="${url%%\?*}"
-  filename="${base##*/}"
-  path="${ASSET_DIR}/${filename}"
+  local path tmp
+  path="$(cache_path_for_url "$url")"
   tmp="${path}.tmp"
 
-  # if already cached and non-empty, use it
   if [[ -s "$path" ]]; then
-    printf '%s\n' "$path"
+    echo "$path"
     return 0
   fi
 
-  # download
-  if ! curl "${CURL_ASSET_OPTS[@]}" "${curl_headers[@]}" -o "$tmp" "$url"; then
-    rm -f "$tmp" >/dev/null 2>&1 || true
-    log "WARN: download failed: $url"
-    return 1
-  fi
-
-  # detect mime type (requires 'file')
-  mime="$(file -b --mime-type "$tmp" 2>/dev/null || echo "")"
-
-  # reject common error payloads saved as "images"
-  case "$mime" in
-    text/html|application/json|text/*)
-      log "WARN: cached non-media ($mime), deleting: $url"
-      rm -f "$tmp" >/dev/null 2>&1 || true
-      return 1
-      ;;
-  esac
-
-  # choose extension if filename has no dot
-  ext=""
-  if [[ "$filename" != *.* ]]; then
-    case "$mime" in
-      image/jpeg) ext="jpg" ;;
-      image/png)  ext="png" ;;
-      image/webp) ext="webp" ;;
-      image/gif)  ext="gif" ;;
-      video/mp4)  ext="mp4" ;;
-      video/webm) ext="webm" ;;
-      video/quicktime) ext="mov" ;;
-      video/x-matroska) ext="mkv" ;;
-      *) ext="" ;;
-    esac
-  fi
-
-  # finalize path (append ext if we picked one)
-  if [[ -n "$ext" ]]; then
-    final="${path}.${ext}"
+  if curl "${CURL_ASSET_OPTS[@]}" "${curl_headers[@]}" -o "$tmp" "$url"; then
+    mv "$tmp" "$path"
+    echo "$path"
   else
-    final="$path"
+    rm -f "$tmp"
+    log "WARN: download failed, streaming: $url"
+    echo "$url"
   fi
-
-  # if final already exists (race), discard tmp and use it
-  if [[ -s "$final" ]]; then
-    rm -f "$tmp" >/dev/null 2>&1 || true
-    printf '%s\n' "$final"
-    return 0
-  fi
-
-  # move into place
-  mv -f "$tmp" "$final"
-  printf '%s\n' "$final"
-  return 0
 }
 
 background_fetch_pending() {
@@ -301,11 +251,7 @@ mpv_wait_until_eof_with_timeout() {
 play_url() {
   local url src
   url="$(normalize_url "$1")"
-
-  if ! src="$(cache_asset "$url")"; then
-    log "WARN: skip (cache_asset failed): $url"
-    return 0
-  fi
+  src="$(cache_asset "$url")"
 
   start_mpv_if_needed
 
@@ -317,7 +263,7 @@ play_url() {
 
   mpv_send "{\"command\":[\"loadfile\",\"$src\",\"replace\"]}"
 
-  # DEBUG: what mpv actually thinks it loaded
+  # DEBUG: what mpv actually thinks it loaded (key for diagnosing flash-skip)
   log "DBG: want_src=$(printf '%q' "$src") mpv_path=$(mpv_get_prop_data path) mpv_filename=$(mpv_get_prop_data filename)"
 
   if is_video "$url"; then
