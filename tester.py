@@ -4,31 +4,39 @@ PORT = "/dev/serial/by-id/usb-Qibixx_MDB-HAT_0-if00"
 BAUD = 115200
 SNIFF_SECONDS = 15
 
-POLL_HEX = {"12"}  # drop spammy poll byte(s)
+POLL_BYTE = 0x12  # MDB poll byte
 
 def parse_line(line: bytes):
     """
     Expected examples:
       b'x,00,0002599672,12,'
       b'x,80,0002632404,0301f4'
+      b'x,00,0002671896,13,0000190101'
       b'x,ACK'
       b'v,4.0.2.0,...'
     """
     s = line.decode(errors="replace").strip()
     if not s:
         return None
-    parts = s.split(",")
-    return s, parts
+    return s, s.split(",")
 
 def hex_to_bytes(hexstr: str) -> bytes:
-    hexstr = hexstr.strip().lower().replace("0x", "")
+    hexstr = (hexstr or "").strip().lower().replace("0x", "")
     hexstr = re.sub(r"[^0-9a-f]", "", hexstr)
-    if len(hexstr) == 0:
+    if not hexstr:
         return b""
     if len(hexstr) % 2 == 1:
-        # if odd, left-pad (rare, but avoids crash)
         hexstr = "0" + hexstr
     return bytes.fromhex(hexstr)
+
+def strip_leading_polls(b: bytes) -> bytes:
+    i = 0
+    while i < len(b) and b[i] == POLL_BYTE:
+        i += 1
+    return b[i:]
+
+def is_all_polls(b: bytes) -> bool:
+    return len(b) > 0 and all(x == POLL_BYTE for x in b)
 
 with serial.Serial(PORT, baudrate=BAUD, timeout=0.3, write_timeout=0.3) as s:
     print("opened", PORT, "baud", BAUD, flush=True)
@@ -54,7 +62,19 @@ with serial.Serial(PORT, baudrate=BAUD, timeout=0.3, write_timeout=0.3) as s:
         while time.time() < end:
             s.readline()
 
-    # 1) hard-reset sniff state
+    # ---- helper: append hex tokens, never poll-only tokens ----
+    def maybe_add_hex(tok: str):
+        tok = (tok or "").strip().strip(",")
+        if not tok:
+            return
+        if not re.fullmatch(r"[0-9A-Fa-f]+", tok):
+            return
+        # drop pure poll tokens
+        if tok.lower() == "12":
+            return
+        cur.extend(hex_to_bytes(tok))
+
+    # 1) reset sniff state
     send("X,0")
     drain(0.6)
 
@@ -75,9 +95,8 @@ with serial.Serial(PORT, baudrate=BAUD, timeout=0.3, write_timeout=0.3) as s:
 
     print(f"=== sniffing ({SNIFF_SECONDS}s) ===", flush=True)
 
-    # Frame builder: collect data bytes until we see ACK, then emit a frame
+    # Frame builder: collect data bytes; on ACK emit a frame
     cur = bytearray()
-    last_ts = None
 
     end = time.time() + SNIFF_SECONDS
     while time.time() < end:
@@ -85,50 +104,42 @@ with serial.Serial(PORT, baudrate=BAUD, timeout=0.3, write_timeout=0.3) as s:
         if not line:
             continue
 
-        raw, parts = parse_line(line)
+        parsed = parse_line(line)
+        if not parsed:
+            continue
+        raw, parts = parsed
+
         if raw.startswith("v,"):
-            # ignore stray version lines
-            continue
+            continue  # ignore stray version lines
 
-        # ACK line might be just "x,ACK" or embedded
+        # ACK terminates a frame
         if "ACK" in raw:
-            if cur.hex() == "12":
-                # it's just a poll byte
-                continue
             if cur:
-                print("FRAME:", cur.hex(), flush=True)
+                frame = bytes(cur)
                 cur.clear()
+
+                # remove leading poll spam
+                frame2 = strip_leading_polls(frame)
+
+                # ignore poll-only frames
+                if not frame2 or is_all_polls(frame2):
+                    continue
+
+                print("FRAME:", frame2.hex(), flush=True)
             continue
 
-        # Typical sniff line: x,00,<ts>,<hex...>
-        # Grab last field that looks hex-ish
-        payload = parts[-1].strip()
-        payload = payload.strip()  # may be '12' or '0301f4' etc
-        payload = payload.replace("\r", "").replace("\n", "")
-        payload = payload.strip(",")
-
-        # Drop common poll spam
-        if payload.lower() in POLL_HEX:
-            continue
-
-        # Some lines like: x,00,....,13,0000190101  (two payload-ish fields)
-        # If we see that, append both bytes chunks
+        # Typical sniff lines are comma-separated; payload is usually last field,
+        # but sometimes there are two payload fields (e.g. "... ,13,0000190101")
+        # We attempt to append both last-2 and last fields if they look hex.
         if len(parts) >= 5:
-            maybe1 = parts[-2].strip().strip(",")
-            maybe2 = parts[-1].strip().strip(",")
-            # only treat as hex if it looks like it
-            if re.fullmatch(r"[0-9A-Fa-f]+", maybe1 or ""):
-                cur += hex_to_bytes(maybe1)
-            if re.fullmatch(r"[0-9A-Fa-f]+", maybe2 or ""):
-                cur += hex_to_bytes(maybe2)
+            maybe_add_hex(parts[-2])
+            maybe_add_hex(parts[-1])
         else:
-            if re.fullmatch(r"[0-9A-Fa-f]+", payload or ""):
-                cur += hex_to_bytes(payload)
-            else:
-                # If it’s not hex, still print it so we don’t lose info
-                print("RAW:", raw, flush=True)
+            # last field as payload
+            payload = (parts[-1] if parts else "").strip().strip(",")
+            maybe_add_hex(payload)
 
-    # Optional: stop sniff on exit so next run starts clean
+    # Stop sniff on exit so next run starts clean
     send("X,0")
     drain(0.2)
 
