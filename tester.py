@@ -92,6 +92,9 @@ with serial.Serial(PORT, baudrate=BAUD, timeout=0.3, write_timeout=0.3) as s:
 
         # ACK line might be just "x,ACK" or embedded
         if "ACK" in raw:
+            if cur.hex() == "12":
+                # it's just a poll byte
+                continue
             if cur:
                 print("FRAME:", cur.hex(), flush=True)
                 cur.clear()
