@@ -1,77 +1,41 @@
-import serial, time, binascii
+import serial, time
 
 PORT = "/dev/serial/by-id/usb-Qibixx_MDB-HAT_0-if00"
+BAUD = 115200
 
-def hexdump(b: bytes, maxlen=256):
-    b = b[:maxlen]
-    return binascii.hexlify(b).decode()
+def send(s: serial.Serial, cmd: str):
+    s.write((cmd + "\r").encode())
+    s.flush()
 
-def run(baud: int):
-    print(f"\n=== baud {baud} ===", flush=True)
-
-    s = serial.Serial(
-        PORT,
-        baudrate=baud,
-        timeout=0.05,          # short poll
-        write_timeout=0.2,
-        xonxoff=False,
-        rtscts=False,
-        dsrdtr=False,
-    )
-
-    # Prevent “open toggles reset” vibes on some boards
-    try:
-        s.setDTR(True)
-        s.setRTS(True)
-    except Exception:
-        pass
-
-    print("opened", flush=True)
-
+with serial.Serial(PORT, BAUD, timeout=1.0, write_timeout=1.0) as s:
     s.reset_input_buffer()
     s.reset_output_buffer()
 
-    def cmd(c: str, read_window=0.4):
-        payload = (c + "\r").encode()     # IMPORTANT: CR only
-        s.write(payload)
-        s.flush()
+    # Version
+    send(s, "V")
+    print("V ->", s.readline().decode(errors="replace").rstrip())
 
-        end = time.time() + read_window
-        out = b""
-        while time.time() < end:
-            chunk = s.read(4096)
-            if chunk:
-                out += chunk
-                # small “extend window” if data is still flowing
-                end = time.time() + 0.08
+    # Enable sniff (should answer x,ACK)
+    send(s, "X,1")
+    t0 = time.time()
+    got_ack = False
+    while time.time() - t0 < 2.0:
+        line = s.readline()
+        if not line:
+            continue
+        text = line.decode(errors="replace").rstrip()
+        print(text)
+        if text.startswith("x,ACK"):
+            got_ack = True
+            break
 
-        # Pretty-print line-ish replies, but keep raw bytes too
-        printable = out.replace(b"\r", b"\\r").replace(b"\n", b"\\n")
-        print(f"cmd {c!r} -> {printable!r}", flush=True)
-        return out
+    if not got_ack:
+        print("NO x,ACK from X,1 (likely line ending / port conflict / device not accepting cmd)")
+        raise SystemExit(1)
 
-    # Ping + enable sniff
-    cmd("V")
-    cmd("X,1")
-
-    # Stream read
-    t_end = time.time() + 4.0
-    total = 0
-    sample = b""
-
-    while time.time() < t_end:
-        n = s.in_waiting
-        b = s.read(n if n else 4096)
-        if b:
-            total += len(b)
-            if len(sample) < 400:
-                sample += b
-
-    print("stream_bytes:", total, flush=True)
-    print("sample_ascii:", sample[:200].replace(b"\r", b"\\r").replace(b"\n", b"\\n"), flush=True)
-    print("sample_hex:", hexdump(sample, 256), flush=True)
-
-    s.close()
-
-for b in (115200, 57600, 38400, 19200, 9600):
-    run(b)
+    print("=== sniffing (10s) ===")
+    end = time.time() + 10
+    while time.time() < end:
+        line = s.readline()
+        if line:
+            print(line.decode(errors="replace").rstrip())
