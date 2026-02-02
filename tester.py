@@ -67,5 +67,4 @@ def run(baud: int):
     print("done.", flush=True)
 
 if __name__ == "__main__":
-    for b in (115200, 57600, 38400, 19200, 9600):
-        run(b)
+    run(115200)
