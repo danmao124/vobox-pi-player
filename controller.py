@@ -78,10 +78,13 @@ def main():
     # DEVICE_ID = hostname
     device_id = os.uname().nodename  # same as `hostname`
 
-    # secret = "pi's device id" (assuming your config.env has ID=...)
-    secret = cfg.get("ID") or cfg.get("DEVICE_SECRET") or cfg.get("SECRET")
+    # secret = machine-id from /etc/machine-id
+    machine_id_path = Path("/etc/machine-id")
+    if not machine_id_path.exists():
+        raise FileNotFoundError("Missing /etc/machine-id file")
+    secret = machine_id_path.read_text().strip()
     if not secret:
-        raise ValueError("Secret missing in config.env (expected ID=... or DEVICE_SECRET=... or SECRET=...)")
+        raise ValueError("Empty machine-id in /etc/machine-id")
 
     interval = int(cfg.get("HEARTBEAT_SECONDS", "10"))  # default 10 seconds
     url = f"{api_base}/device/askforevent"
