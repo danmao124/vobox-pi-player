@@ -79,7 +79,7 @@ def main():
         headers = build_headers(device_id, secret, body_bytes)
 
         try:
-            r = requests.post(url, data=body_bytes, headers=headers, timeout="5")
+            r = requests.post(url, data=body_bytes, headers=headers, timeout=5)
             print(f"[heartbeat] HTTP {r.status_code}: {r.text[:200]}")
         except Exception as e:
             print(f"[heartbeat] request failed: {e}")
