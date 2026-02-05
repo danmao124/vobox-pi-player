@@ -57,7 +57,7 @@ def main():
     here = Path(__file__).resolve().parent
     cfg = load_env_file(here / "config.env")
 
-    api_base = cfg.get("API_BASE", "").rstrip("/")
+    api_base = cfg.get("API_BASE", "")
     if not api_base:
         raise ValueError("API_BASE missing in config.env")
 
@@ -72,6 +72,8 @@ def main():
     interval = int(cfg.get("HEARTBEAT_SECONDS", "10"))  # default 10 seconds
     url = f"{api_base}/device/askforevent"
     payload = {}
+
+    print(f"[heartbeat] url: {url}")
 
     while True:
         # IMPORTANT: sign exact bytes that you send
