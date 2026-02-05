@@ -70,7 +70,7 @@ def main():
         raise ValueError("Secret missing in config.env (expected ID=... or DEVICE_SECRET=... or SECRET=...)")
 
     interval = int(cfg.get("HEARTBEAT_SECONDS", "10"))  # default 10 seconds
-    url = f"{api_base}/api/v1/device/askforevent"
+    url = f"{api_base}/device/askforevent"
     payload = {}
 
     while True:
