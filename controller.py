@@ -51,6 +51,11 @@ def build_headers(device_id: str, secret: str, payload: dict) -> tuple[dict, byt
     canonical = f"{timestamp}.{body_hash}".encode("utf-8")
     signature = hmac_sha256_hex(secret.encode("utf-8"), canonical)
 
+    console.log("timestamp", timestamp);
+    console.log("deviceSecret", secret);
+    console.log("canonical", canonical);
+    console.log("signature", signature);
+
     headers = {
         "Content-Type": "application/json",
         "X-Device-Id": device_id,
