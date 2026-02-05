@@ -38,18 +38,27 @@ def hmac_sha256_hex(secret: bytes, msg: bytes) -> str:
     return hmac.new(secret, msg, hashlib.sha256).hexdigest()
 
 
-def build_headers(device_id: str, secret: str, body_bytes: bytes) -> dict:
-    ts = str(int(time.time()))
+def build_headers(device_id: str, secret: str, payload: dict) -> tuple[dict, bytes]:
+    """
+    Build request headers and body bytes from payload.
+    Returns (headers_dict, body_bytes) to ensure signed bytes match sent bytes.
+    """
+    # IMPORTANT: sign exact bytes that you send
+    body_bytes = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    
+    timestamp = str(int(time.time()))
     body_hash = sha256_hex(body_bytes)
-    canonical = f"{ts}.{body_hash}".encode("utf-8")
-    sig = hmac_sha256_hex(secret.encode("utf-8"), canonical)
+    canonical = f"{timestamp}.{body_hash}".encode("utf-8")
+    signature = hmac_sha256_hex(secret.encode("utf-8"), canonical)
 
-    return {
+    headers = {
         "Content-Type": "application/json",
         "X-Device-Id": device_id,
-        "X-Timestamp": ts,
-        "X-Signature": sig,
+        "X-Timestamp": timestamp,
+        "X-Signature": signature,
     }
+    
+    return headers, body_bytes
 
 
 def main():
@@ -76,9 +85,7 @@ def main():
     print(f"[heartbeat] url: {url}")
 
     while True:
-        # IMPORTANT: sign exact bytes that you send
-        body_bytes = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
-        headers = build_headers(device_id, secret, body_bytes)
+        headers, body_bytes = build_headers(device_id, secret, payload)
 
         try:
             r = requests.post(url, data=body_bytes, headers=headers, timeout=5)
