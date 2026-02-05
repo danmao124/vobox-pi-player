@@ -1,2 +1,3 @@
 config.env
+venditt-player.service
 *.env
