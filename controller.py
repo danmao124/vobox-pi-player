@@ -69,20 +69,9 @@ def main():
     if not secret:
         raise ValueError("Secret missing in config.env (expected ID=... or DEVICE_SECRET=... or SECRET=...)")
 
-    interval = int(cfg.get("HEARTBEAT_SECONDS", "300"))  # default 5 min
-    timeout = float(cfg.get("HTTP_TIMEOUT_SECONDS", "5"))
-
-    url = f"{api_base}/api/v1/device/logheartbeat"
-
-    payload = {
-        "type": "heartbeat",
-        "data": {
-            "hostname": device_id,
-        },
-    }
-
-    backoff = 1
-    max_backoff = 60
+    interval = int(cfg.get("HEARTBEAT_SECONDS", "10"))  # default 10 seconds
+    url = f"{api_base}/api/v1/device/askforevent"
+    payload = {}
 
     while True:
         # IMPORTANT: sign exact bytes that you send
@@ -90,18 +79,12 @@ def main():
         headers = build_headers(device_id, secret, body_bytes)
 
         try:
-            r = requests.post(url, data=body_bytes, headers=headers, timeout=timeout)
-            if 200 <= r.status_code < 300:
-                backoff = 1
-                time.sleep(interval)
-            else:
-                print(f"[heartbeat] HTTP {r.status_code}: {r.text[:200]}")
-                time.sleep(backoff)
-                backoff = min(backoff * 2, max_backoff)
+            r = requests.post(url, data=body_bytes, headers=headers, timeout="5")
+            print(f"[heartbeat] HTTP {r.status_code}: {r.text[:200]}")
         except Exception as e:
             print(f"[heartbeat] request failed: {e}")
-            time.sleep(backoff)
-            backoff = min(backoff * 2, max_backoff)
+
+        time.sleep(interval)
 
 
 if __name__ == "__main__":
