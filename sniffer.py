@@ -2,7 +2,7 @@ import serial, time, re
 
 PORT = "/dev/serial/by-id/usb-Qibixx_MDB-HAT_0-if00"
 BAUD = 115200
-SNIFF_SECONDS = 15
+SNIFF_SECONDS = 100
 
 POLL_BYTE = 0x12  # MDB poll byte
 
