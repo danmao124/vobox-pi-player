@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-  python3 translator_final.py --comp-credit 5.00 --comp-oneshot --debug
+  python3 translator.py --comp-credit 5.00 --comp-oneshot --debug
 """
 
 import serial, time, re, argparse

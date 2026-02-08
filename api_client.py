@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+"""
+Shared API client functions for making authenticated requests to the Venditt API.
+"""
 import os
 import time
 import json
@@ -31,17 +34,28 @@ def load_env_file(path: Path) -> dict:
 
 
 def sha256_hex(data: bytes) -> str:
+    """Compute SHA256 hash of data and return as hex string."""
     return hashlib.sha256(data).hexdigest()
 
 
 def hmac_sha256_hex(secret: bytes, msg: bytes) -> str:
+    """Compute HMAC-SHA256 of message with secret and return as hex string."""
     return hmac.new(secret, msg, hashlib.sha256).hexdigest()
 
 
-def build_headers(device_id: str, secret: str, payload: dict) -> tuple[dict, bytes]:
+def build_headers(device_id: str, secret: str, payload: dict, debug: bool = False) -> tuple[dict, bytes]:
     """
     Build request headers and body bytes from payload.
     Returns (headers_dict, body_bytes) to ensure signed bytes match sent bytes.
+    
+    Args:
+        device_id: Device identifier (typically hostname)
+        secret: Secret key for HMAC signing (typically machine-id)
+        payload: Dictionary to send as JSON body
+        debug: If True, print debug information
+    
+    Returns:
+        Tuple of (headers_dict, body_bytes)
     """
     # IMPORTANT: sign exact bytes that you send
     body_bytes = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
@@ -51,10 +65,11 @@ def build_headers(device_id: str, secret: str, payload: dict) -> tuple[dict, byt
     canonical = f"{timestamp}.{body_hash}".encode("utf-8")
     signature = hmac_sha256_hex(secret.encode("utf-8"), canonical)
 
-    print("timestamp", timestamp);
-    print("deviceSecret", secret);
-    print("canonical", canonical);
-    print("signature", signature);
+    if debug:
+        print("timestamp", timestamp)
+        print("deviceSecret", secret)
+        print("canonical", canonical)
+        print("signature", signature)
 
     headers = {
         "Content-Type": "application/json",
@@ -66,15 +81,13 @@ def build_headers(device_id: str, secret: str, payload: dict) -> tuple[dict, byt
     return headers, body_bytes
 
 
-def main():
-    # config.env in the same dir as this script
-    here = Path(__file__).resolve().parent
-    cfg = load_env_file(here / "config.env")
-
-    api_base = cfg.get("API_BASE", "")
-    if not api_base:
-        raise ValueError("API_BASE missing in config.env")
-
+def get_device_credentials() -> tuple[str, str]:
+    """
+    Get device ID and secret from system.
+    
+    Returns:
+        Tuple of (device_id, secret)
+    """
     # DEVICE_ID = hostname
     device_id = os.uname().nodename  # same as `hostname`
 
@@ -85,24 +98,28 @@ def main():
     secret = machine_id_path.read_text().strip()
     if not secret:
         raise ValueError("Empty machine-id in /etc/machine-id")
-
-    interval = int(cfg.get("HEARTBEAT_SECONDS", "10"))  # default 10 seconds
-    url = f"{api_base}/device/askforevent"
-    payload = {}
-
-    print(f"[heartbeat] url: {url}")
-
-    while True:
-        headers, body_bytes = build_headers(device_id, secret, payload)
-
-        try:
-            r = requests.post(url, data=body_bytes, headers=headers, timeout=5)
-            print(f"[heartbeat] HTTP {r.status_code}: {r.text[:200]}")
-        except Exception as e:
-            print(f"[heartbeat] request failed: {e}")
-
-        time.sleep(interval)
+    
+    return device_id, secret
 
 
-if __name__ == "__main__":
-    main()
+def api_post(url: str, payload: dict, device_id: str = None, secret: str = None, 
+             timeout: float = 5.0, debug: bool = False) -> requests.Response:
+    """
+    Make an authenticated POST request to the API.
+    
+    Args:
+        url: Full URL to POST to
+        payload: Dictionary to send as JSON body
+        device_id: Device ID (if None, will be fetched from system)
+        secret: Secret key (if None, will be fetched from system)
+        timeout: Request timeout in seconds
+        debug: If True, print debug information
+    
+    Returns:
+        requests.Response object
+    """
+    if device_id is None or secret is None:
+        device_id, secret = get_device_credentials()
+    
+    headers, body_bytes = build_headers(device_id, secret, payload, debug=debug)
+    return requests.post(url, data=body_bytes, headers=headers, timeout=timeout)
