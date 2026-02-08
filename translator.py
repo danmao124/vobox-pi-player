@@ -1,32 +1,11 @@
 #!/usr/bin/env python3
 """
-translator_final.py (+ comp credit mode)
-
-New feature: COMP MODE
-- --comp-credit 5.00
-    Arms the VMC with that much credit *without* requiring Nayax CREDIT
-    and auto-approves vends up to that amount by sending C,VEND,<price>.
-    (Skips Nayax for that vend.)
-
-- --comp-oneshot
-    After the first successful vend, comp mode turns off automatically.
-
-Why:
-- Lets you "give yourself $5" (free vend credit) on demand.
-
-Run examples:
-  # Normal Nayax-gated operation:
-  python3 translator_final.py --port /dev/serial/by-id/usb-Qibixx_MDB-HAT_0-if00 --max-credit 2.00 --debug
-
-  # Give yourself $5 credit (free vends up to $5) while script runs:
-  python3 translator_final.py --port /dev/serial/by-id/usb-Qibixx_MDB-HAT_0-if00 --comp-credit 5.00 --debug
-
-  # One-shot comp (one free vend) then revert to normal Nayax gating:
-  python3 translator_final.py --port /dev/serial/by-id/usb-Qibixx_MDB-HAT_0-if00 --comp-credit 5.00 --comp-oneshot --max-credit 2.00 --debug
+  python3 translator_final.py --comp-credit 5.00 --comp-oneshot --debug
 """
 
 import serial, time, re, argparse
 from decimal import Decimal
+from pathlib import Path
 
 BAUD = 115200
 
@@ -61,6 +40,27 @@ def parse_money(s: str) -> Decimal:
 def debug_print(enabled: bool, txt: str):
     if enabled and txt and txt[0] in ("c", "d", "x"):
         print(txt, flush=True)
+
+def load_env_file(path: Path) -> dict:
+    """
+    Minimal .env parser: KEY=VALUE lines, ignores blanks/comments.
+    Strips surrounding quotes.
+    """
+    env = {}
+    if not path.exists():
+        raise FileNotFoundError(f"Missing config file: {path}")
+
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        k = k.strip()
+        v = v.strip().strip('"').strip("'")
+        env[k] = v
+    return env
 
 def wait_for(s: serial.Serial, regex, timeout_s: float, debug=False):
     end = time.time() + timeout_s
@@ -139,9 +139,21 @@ def arm_credit_safe(s: serial.Serial, credit: Decimal, debug=False) -> bool:
 
 # ---------- main loop ----------
 def main():
+    # Load config from config.env
+    here = Path(__file__).resolve().parent
+    cfg = load_env_file(here / "config.env")
+    
+    port = cfg.get("PORT", "")
+    if not port:
+        raise ValueError("PORT missing in config.env")
+    
+    max_credit_str = cfg.get("MAX_CREDIT", "10.00")
+    try:
+        max_credit = Decimal(max_credit_str)
+    except Exception:
+        raise ValueError(f"Invalid MAX_CREDIT value in config.env: {max_credit_str}")
+
     ap = argparse.ArgumentParser()
-    ap.add_argument("--port", required=True)
-    ap.add_argument("--max-credit", default="2.00", help="Normal (Nayax-gated) credit to arm on VMC.")
     ap.add_argument("--nayax-timeout", type=int, default=15)
     ap.add_argument("--credit-wait", type=float, default=6.0, help="Seconds to wait for Nayax CREDIT after VMC VEND")
     ap.add_argument("--debug", action="store_true")
@@ -154,12 +166,11 @@ def main():
 
     args = ap.parse_args()
 
-    max_credit = Decimal(args.max_credit)
     comp_credit = Decimal(args.comp_credit) if args.comp_credit is not None else None
     comp_active = comp_credit is not None
 
-    with serial.Serial(args.port, BAUD, timeout=0.3, write_timeout=0.3) as s:
-        print("opened", args.port, flush=True)
+    with serial.Serial(port, BAUD, timeout=0.3, write_timeout=0.3) as s:
+        print("opened", port, flush=True)
 
         if not init_vmc_slave(s, debug=args.debug):
             return
