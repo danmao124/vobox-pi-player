@@ -52,17 +52,25 @@ def fmt_money(x: Decimal) -> str:
     return f"{x:.2f}"
 
 def main():
-    ap = argparse.ArgumentParser(description="Qibixx split-mode: Cashless Slave credit/approve VMC vend requests")
+    ap = argparse.ArgumentParser(description="Qibixx Cashless Slave: start session + approve VMC vend requests")
     ap.add_argument("--port", default=DEFAULT_PORT)
     ap.add_argument("--auto", action="store_true", help="Auto-approve vend requests")
     ap.add_argument("--max-amount", default=None, help="Deny if amount > this (e.g. 2.00)")
     ap.add_argument("--allow-products", default=None, help="Comma list of allowed product_ids (e.g. 2,10)")
     ap.add_argument("--duration", type=int, default=0, help="Seconds to run (0=forever)")
     ap.add_argument("--debug-raw", action="store_true", help="Print all c,/x,/d, lines")
+
+    # NEW:
+    ap.add_argument("--start-amount", default=None,
+                    help="Start/arm a cashless session with this credit (e.g. 2.00). Needed on non-Always-Idle VMCs.")
+    ap.add_argument("--start-interval", type=int, default=0,
+                    help="If >0, re-send C,START every N seconds while waiting (helps some VMCs).")
+
     args = ap.parse_args()
 
     max_amount = Decimal(args.max_amount) if args.max_amount else None
     allow_products = set(p.strip() for p in args.allow_products.split(",")) if args.allow_products else None
+    start_amount = Decimal(args.start_amount) if args.start_amount else None
 
     with open_serial(args.port) as s:
         print("opened", args.port, "baud", BAUD, flush=True)
@@ -88,27 +96,40 @@ def main():
             if not line:
                 continue
             txt = clean_line(line)
-            if args.debug_raw and txt:
-                if txt.startswith(("c,", "x,", "d,")):
-                    print(txt, flush=True)
+
+            if args.debug_raw and txt.startswith(("c,", "x,", "d,")):
+                print(txt, flush=True)
 
             if txt in ("c,STATUS,ENABLED", "c,STATUS,IDLE"):
                 enabled = True
                 print("✅ cashless slave active:", txt, flush=True)
                 break
 
-            # Some units briefly say INACTIVE then later IDLE; keep waiting.
-
         if not enabled:
             print("🛑 did not reach ENABLED/IDLE within 30s. If you see INACTIVE/DISABLED only, it's wiring/mode.", flush=True)
+            return
 
         print("=== waiting for vend requests from VMC ===", flush=True)
 
+        # If your VMC is not Always-Idle, you must start a cashless session.
+        if start_amount is not None:
+            cmd = f"C,START,{fmt_money(start_amount)}"
+            send(s, cmd)
+            print(f"⚡ sent: {cmd} (arm cashless credit)", flush=True)
+
         end_time = time.time() + args.duration if args.duration > 0 else None
+        next_start_time = (time.time() + args.start_interval) if (start_amount is not None and args.start_interval > 0) else None
 
         while True:
             if end_time and time.time() > end_time:
                 break
+
+            # optional re-arm
+            if next_start_time is not None and time.time() >= next_start_time:
+                cmd = f"C,START,{fmt_money(start_amount)}"
+                send(s, cmd)
+                print(f"⚡ re-sent: {cmd}", flush=True)
+                next_start_time = time.time() + args.start_interval
 
             line = s.readline()
             if not line:
@@ -120,47 +141,40 @@ def main():
             if args.debug_raw and txt.startswith(("c,", "x,", "d,")):
                 print(txt, flush=True)
 
-            # Vend request from VMC (always-idle style)
+            # Vend request from VMC
             m = VEND_REQ_RE.match(txt)
-            if m:
-                amt_s, product_id = m.group(1), m.group(2)
-
-                try:
-                    amt = parse_amount(amt_s)
-                except Exception:
-                    print("🛑 amount parse failed:", txt, flush=True)
-                    continue
-
-                decision = "APPROVE"
-                reason = ""
-
-                if max_amount is not None and amt > max_amount:
-                    decision = "DENY"
-                    reason = f"amount {amt} > max {max_amount}"
-
-                if allow_products is not None and product_id not in allow_products:
-                    decision = "DENY"
-                    reason = f"product {product_id} not allowed"
-
-                print(f"🧠 VEND REQ amount=${fmt_money(amt)} product_id={product_id} -> {decision}"
-                      + (f" ({reason})" if reason else ""), flush=True)
-
-                if args.auto and decision == "APPROVE":
-                    cmd = f"C,VEND,{fmt_money(amt)}"
-                    send(s, cmd)
-                    print(f"😈 sent: {cmd}", flush=True)
-                else:
-                    send(s, "C,STOP")
-                    print("🛑 sent: C,STOP", flush=True)
+            if not m:
                 continue
 
-            # Completion
-            if txt == "c,VEND,SUCCESS":
-                print("🧾 VEND SUCCESS", flush=True)
+            amt_s, product_id = m.group(1), m.group(2)
+
+            try:
+                amt = parse_amount(amt_s)
+            except Exception:
+                print("🛑 amount parse failed:", txt, flush=True)
                 continue
-            if txt.startswith("c,ERR,VEND"):
-                print("🛑 VEND ERROR:", txt, flush=True)
-                continue
+
+            decision = "APPROVE"
+            reason = ""
+
+            if max_amount is not None and amt > max_amount:
+                decision = "DENY"
+                reason = f"amount {amt} > max {max_amount}"
+
+            if allow_products is not None and product_id not in allow_products:
+                decision = "DENY"
+                reason = f"product {product_id} not allowed"
+
+            print(f"🧠 VEND REQ amount=${fmt_money(amt)} product_id={product_id} -> {decision}"
+                  + (f" ({reason})" if reason else ""), flush=True)
+
+            if args.auto and decision == "APPROVE":
+                cmd = f"C,VEND,{fmt_money(amt)}"
+                send(s, cmd)
+                print(f"😈 sent: {cmd}", flush=True)
+            else:
+                send(s, "C,STOP")
+                print("🛑 sent: C,STOP", flush=True)
 
         # Cleanup
         send(s, "X,0")
