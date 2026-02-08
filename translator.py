@@ -1,41 +1,48 @@
 #!/usr/bin/env python3
+"""
+translator_final.py
+
+Split-mode Qibixx Pi Hat translator:
+- VMC side: act as CASHLESS SLAVE (C,...) to the vending machine VMC
+- Nayax side: act as CASHLESS MASTER (D,...) to the Nayax reader
+- Flow:
+    1) Wait for VMC ENABLED
+    2) Init Nayax master until IDLE
+    3) Arm VMC credit with C,START (retry-safe; fixes START -3)
+    4) On c,STATUS,VEND,price,product -> D,REQ,price,product_sanitized
+    5) If Nayax approves -> C,VEND,price else C,STOP
+    6) D,END then re-arm
+
+Run:
+  python3 translator_final.py --port /dev/serial/by-id/usb-Qibixx_MDB-HAT_0-if00 --max-credit 2.00 --debug
+"""
+
 import serial, time, re, argparse
 from decimal import Decimal
 
 BAUD = 115200
 
-# VMC-side patterns
-VEND_REQ_RE = re.compile(r"^c,STATUS,VEND,([^,]+),([^,]+)\s*$")
+# ---------- regex ----------
 VMC_ENABLED_RE = re.compile(r"^c,STATUS,ENABLED\b")
 VMC_IDLE_CREDIT_RE = re.compile(r"^c,STATUS,IDLE,([^,]+)\s*$")
-VMC_IDLE_RE = re.compile(r"^c,STATUS,IDLE\b")
+VMC_IDLE_RE = re.compile(r"^c,STATUS,IDLE\s*$")
+VMC_VEND_RE = re.compile(r"^c,STATUS,VEND,([^,]+),([^,]+)\s*$")
+VMC_START_ERR_RE = re.compile(r'^c,ERR,"START\s+(-?\d+)"\s*$')
 
-# Nayax-side patterns
-N_OFF_RE   = re.compile(r"^d,STATUS,OFF\b")
-N_INIT_RE  = re.compile(r"^d,STATUS,INIT,(\d+)\b")
-N_IDLE_RE  = re.compile(r"^d,STATUS,IDLE\b")
-N_RESULT_RE = re.compile(r"^d,STATUS,RESULT,([-\d]+)")
-N_ERR_RE   = re.compile(r"^d,ERR,\"([-\d]+)\"")
+N_OFF_RE = re.compile(r"^d,STATUS,OFF\b")
+N_INIT_RE = re.compile(r"^d,STATUS,INIT,(\d+)\b")
+N_IDLE_RE = re.compile(r"^d,STATUS,IDLE\b")
+N_RESULT_RE = re.compile(r"^d,STATUS,RESULT,([-\d]+)\b")
+N_ERR_RE = re.compile(r'^d,ERR,"([-\d]+)"\s*$')
 
+# ---------- helpers ----------
 def clean(b: bytes) -> str:
     return b.decode(errors="replace").strip()
 
 def send(s: serial.Serial, cmd: str):
+    # Qibixx is happiest with CRLF
     s.write((cmd + "\r\n").encode("ascii"))
     s.flush()
-
-def wait_for(s: serial.Serial, regex, timeout_s=5, debug=False):
-    end = time.time() + timeout_s
-    while time.time() < end:
-        line = s.readline()
-        if not line:
-            continue
-        txt = clean(line)
-        if debug and txt and txt[0] in ("c","d","x"):
-            print(txt, flush=True)
-        if regex.match(txt):
-            return txt
-    return None
 
 def fmt_money(x: Decimal) -> str:
     return f"{x:.2f}"
@@ -43,38 +50,100 @@ def fmt_money(x: Decimal) -> str:
 def parse_money(s: str) -> Decimal:
     return Decimal(s.strip())
 
+def debug_print(enabled: bool, txt: str):
+    if enabled and txt and txt[0] in ("c", "d", "x"):
+        print(txt, flush=True)
+
+def wait_for(s: serial.Serial, regex, timeout_s: float, debug=False):
+    end = time.time() + timeout_s
+    while time.time() < end:
+        line = s.readline()
+        if not line:
+            continue
+        txt = clean(line)
+        debug_print(debug, txt)
+        if regex.match(txt):
+            return txt
+    return None
+
+# ---------- init routines ----------
+def init_vmc_slave(s: serial.Serial, debug=False) -> bool:
+    send(s, "X,0")    # no sniff for now
+    send(s, "C,0")    # disable slave
+    time.sleep(0.2)
+
+    send(s, "C,1")    # enable slave
+    print("sent: C,1", flush=True)
+
+    ok = wait_for(s, VMC_ENABLED_RE, timeout_s=30, debug=debug)
+    if not ok:
+        print("🛑 VMC never enabled cashless slave (check wiring: VMC -> RIGHT/Peripheral).", flush=True)
+        return False
+
+    print("✅ VMC enabled cashless slave", flush=True)
+    return True
+
 def init_nayax_master(s: serial.Serial, debug=False) -> bool:
-    # Clean stop/clear
+    # hard reset
     send(s, "D,STOP")
     send(s, "D,0")
-    ok = wait_for(s, N_OFF_RE, timeout_s=8, debug=debug)
+    ok = wait_for(s, N_OFF_RE, timeout_s=10, debug=debug)
     if not ok:
-        print("🛑 Nayax master: did not reach STATUS,OFF", flush=True)
+        print("🛑 Nayax master did not reach d,STATUS,OFF (power/wiring: Nayax -> LEFT/VMC).", flush=True)
         return False
 
-    # Set master
     send(s, "D,2")
-    ok = wait_for(s, N_INIT_RE, timeout_s=8, debug=debug)
+    ok = wait_for(s, N_INIT_RE, timeout_s=10, debug=debug)
     if not ok:
-        print("🛑 Nayax master: did not reach STATUS,INIT,*", flush=True)
+        print("🛑 Nayax master did not reach d,STATUS,INIT,*", flush=True)
         return False
 
-    # Enable reader
     send(s, "D,READER,1")
-    ok = wait_for(s, N_IDLE_RE, timeout_s=10, debug=debug)
+    ok = wait_for(s, N_IDLE_RE, timeout_s=15, debug=debug)
     if not ok:
-        print("🛑 Nayax master: did not reach STATUS,IDLE", flush=True)
+        print("🛑 Nayax master did not reach d,STATUS,IDLE", flush=True)
         return False
 
     print("✅ Nayax master ready (d,STATUS,IDLE)", flush=True)
     return True
 
+# ---------- VMC credit arming (fixes START -3) ----------
+def arm_credit_safe(s: serial.Serial, credit: Decimal, debug=False) -> bool:
+    """
+    Some VMCs will reject START briefly after ENABLED (START -3).
+    We retry until we see c,STATUS,IDLE,<credit> or timeout.
+    """
+    credit_s = fmt_money(credit)
+    for _ in range(12):  # ~6–10 seconds depending on timing
+        send(s, f"C,START,{credit_s}")
+        t_end = time.time() + 0.9
+        while time.time() < t_end:
+            line = s.readline()
+            if not line:
+                continue
+            txt = clean(line)
+            debug_print(debug, txt)
+
+            if VMC_IDLE_CREDIT_RE.match(txt):
+                print(f"⚡ armed VMC credit: {txt}", flush=True)
+                return True
+
+            m_err = VMC_START_ERR_RE.match(txt)
+            if m_err:
+                # START -3 is common if timing is early; just retry
+                break
+        time.sleep(0.4)
+
+    print("🛑 failed to arm VMC credit (kept getting START errors / no IDLE,<credit>)", flush=True)
+    return False
+
+# ---------- main loop ----------
 def main():
-    ap = argparse.ArgumentParser("Split-mode translator: VMC cashless slave + Nayax cashless master")
-    ap.add_argument("--port", required=True, help="e.g. /dev/serial/by-id/usb-Qibixx_MDB-HAT_0-if00")
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--port", required=True)
     ap.add_argument("--max-credit", default="2.00")
-    ap.add_argument("--debug", action="store_true")
     ap.add_argument("--nayax-timeout", type=int, default=15)
+    ap.add_argument("--debug", action="store_true")
     args = ap.parse_args()
 
     max_credit = Decimal(args.max_credit)
@@ -82,112 +151,87 @@ def main():
     with serial.Serial(args.port, BAUD, timeout=0.3, write_timeout=0.3) as s:
         print("opened", args.port, flush=True)
 
-        # Reset slave + sniff off
-        send(s, "X,0")
-        send(s, "C,0")
-        time.sleep(0.2)
-
-        # Enable VMC-side cashless slave
-        send(s, "C,1")
-        print("sent: C,1", flush=True)
-
-        # Wait for VMC enable
-        ok = wait_for(s, VMC_ENABLED_RE, timeout_s=30, debug=args.debug)
-        if not ok:
-            print("🛑 VMC never enabled cashless slave (still INACTIVE). Wiring wrong.", flush=True)
+        if not init_vmc_slave(s, debug=args.debug):
             return
-        print("✅ VMC enabled cashless slave", flush=True)
-
-        # Init Nayax master side
         if not init_nayax_master(s, debug=args.debug):
-            print("🛑 Fix Nayax wiring/power/state first. (Left port should be Nayax; right port should be VMC.)", flush=True)
             return
 
-        # State
         vmc_has_credit = False
-
-        # IMPORTANT: only arm credit when YOU decide (e.g. after Nayax indicates user present).
-        # For MVP, arm immediately once Nayax is ready (later you can gate on a real "card present" signal).
-        def arm_vmc_credit():
-            nonlocal vmc_has_credit
-            if vmc_has_credit:
-                return
-            cmd = f"C,START,{fmt_money(max_credit)}"
-            send(s, cmd)
-            vmc_has_credit = True
-            print(f"⚡ armed VMC credit: {cmd}", flush=True)
-
-        arm_vmc_credit()
-
-        pending = None
-        awaiting = False
+        awaiting_nayax = False
+        pending = None  # (price, vmc_product_raw, nayax_product)
         nayax_deadline = 0.0
+
+        # Arm credit once at start
+        vmc_has_credit = arm_credit_safe(s, max_credit, debug=args.debug)
 
         while True:
             line = s.readline()
             if not line:
                 # Nayax timeout watchdog
-                if awaiting and time.time() > nayax_deadline:
-                    print("🛑 Nayax auth timeout -> C,STOP + D,END", flush=True)
+                if awaiting_nayax and time.time() > nayax_deadline:
+                    print("🛑 Nayax timeout -> C,STOP + D,END", flush=True)
                     send(s, "C,STOP")
                     send(s, "D,END")
-                    awaiting = False
+                    awaiting_nayax = False
                     pending = None
                     vmc_has_credit = False
+                # If idle with no credit, re-arm
+                if not awaiting_nayax and not vmc_has_credit:
+                    vmc_has_credit = arm_credit_safe(s, max_credit, debug=args.debug)
                 continue
 
             txt = clean(line)
             if not txt:
                 continue
-            if args.debug and txt[0] in ("c","d","x"):
-                print(txt, flush=True)
+            debug_print(args.debug, txt)
 
-            # Track credit state
+            # Track VMC credit state
             if VMC_IDLE_CREDIT_RE.match(txt):
                 vmc_has_credit = True
-            if txt == "c,STATUS,IDLE":
+            elif VMC_IDLE_RE.match(txt):
                 vmc_has_credit = False
 
             # VMC vend request
-            m = VEND_REQ_RE.match(txt)
-            if m:
-                price = parse_money(m.group(1))
-                product_raw = m.group(2)
+            m_v = VMC_VEND_RE.match(txt)
+            if m_v:
+                price = parse_money(m_v.group(1))
+                vmc_prod_raw = m_v.group(2)
 
-                # Sanitize product id for Nayax (common expectation: 0..255)
+                # Sanitize product for Nayax: many expect 0..255
                 try:
-                    prod_int = int(product_raw)
+                    prod_int = int(vmc_prod_raw)
                 except Exception:
                     prod_int = 0
-                prod_for_nayax = prod_int & 0xFF  # 257 -> 1
+                nayax_prod = prod_int & 0xFF  # 257 -> 1
 
-                pending = (price, product_raw, prod_for_nayax)
+                pending = (price, vmc_prod_raw, nayax_prod)
 
-                cmd = f"D,REQ,{fmt_money(price)},{prod_for_nayax}"
-                print(f"🧠 VMC wants ${fmt_money(price)} prod_raw={product_raw} -> {cmd}", flush=True)
+                cmd = f"D,REQ,{fmt_money(price)},{nayax_prod}"
+                print(f"🧠 VMC wants ${fmt_money(price)} prod_raw={vmc_prod_raw} -> {cmd}", flush=True)
                 send(s, cmd)
-                awaiting = True
+
+                awaiting_nayax = True
                 nayax_deadline = time.time() + args.nayax_timeout
                 continue
 
-            # Nayax errors
-            em = N_ERR_RE.match(txt)
-            if em and awaiting and pending:
-                code = em.group(1)
-                price, product_raw, prod_for_nayax = pending
-                print(f"🛑 Nayax ERR {code} on D,REQ (prod_raw={product_raw} sent={prod_for_nayax}) -> C,STOP", flush=True)
+            # Nayax immediate ERR
+            m_ne = N_ERR_RE.match(txt)
+            if m_ne and awaiting_nayax and pending:
+                code = m_ne.group(1)
+                price, vmc_prod_raw, nayax_prod = pending
+                print(f"🛑 Nayax ERR {code} on D,REQ (sent prod={nayax_prod}, raw={vmc_prod_raw}) -> C,STOP", flush=True)
                 send(s, "C,STOP")
                 send(s, "D,END")
-                awaiting = False
+                awaiting_nayax = False
                 pending = None
                 vmc_has_credit = False
                 continue
 
-            # Nayax result
-            rm = N_RESULT_RE.match(txt)
-            if rm and awaiting and pending:
-                res = int(rm.group(1))
-                price, product_raw, prod_for_nayax = pending
+            # Nayax RESULT
+            m_nr = N_RESULT_RE.match(txt)
+            if m_nr and awaiting_nayax and pending:
+                res = int(m_nr.group(1))
+                price, vmc_prod_raw, nayax_prod = pending
 
                 if res == 1:
                     print(f"😈 Nayax approved -> C,VEND,{fmt_money(price)}", flush=True)
@@ -197,17 +241,16 @@ def main():
                     send(s, "C,STOP")
 
                 send(s, "D,END")
-                awaiting = False
+                awaiting_nayax = False
                 pending = None
                 vmc_has_credit = False
-                arm_vmc_credit()
                 continue
 
-            # After a vend completes, re-arm credit if desired
+            # Vend complete
             if txt == "c,VEND,SUCCESS":
                 print("🧾 VEND SUCCESS", flush=True)
                 vmc_has_credit = False
-                arm_vmc_credit()
+                continue
 
 if __name__ == "__main__":
     main()
