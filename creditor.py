@@ -1,22 +1,19 @@
 #!/usr/bin/env python3
-import serial, time, re, sys, argparse
+import serial, time, re, argparse
 from decimal import Decimal
 
 DEFAULT_PORT = "/dev/serial/by-id/usb-Qibixx_MDB-HAT_0-if00"
 BAUD = 115200
 
-# Matches: c,STATUS,VEND,<amount>,<product_id>
+# Qibixx Cashless Slave (to VMC) lines we care about
 VEND_REQ_RE = re.compile(r"^c,STATUS,VEND,([^,]+),([^,]+)\s*$")
-
-def now_ms():
-    return int(time.time() * 1000)
 
 def clean_line(b: bytes) -> str:
     return b.decode(errors="replace").strip()
 
 def open_serial(port: str):
     s = serial.Serial(port=port, baudrate=BAUD, timeout=0.3, write_timeout=0.3)
-    # Make CDC-ACM behave nicely
+    # Make CDC-ACM behave nicely after abrupt exits
     try:
         s.dtr = False
         s.rts = False
@@ -30,8 +27,8 @@ def open_serial(port: str):
     return s
 
 def send(s: serial.Serial, cmd: str):
-    # Qibixx accepts CR (and often CRLF). Your sniffer uses "\r" so keep that.
-    s.write((cmd + "\r").encode("ascii"))
+    # Use CRLF (Qibixx examples often require \r\n)
+    s.write((cmd + "\r\n").encode("ascii"))
     s.flush()
 
 def drain(s: serial.Serial, seconds=0.6):
@@ -48,23 +45,20 @@ def get_version(s: serial.Serial, wait_s=1.2):
             return clean_line(line)
     return None
 
-def decimal_str(x: Decimal) -> str:
-    # Qibixx examples use 2 decimals, but allow general
-    # Keep minimal trailing zeros (1.00 stays 1.00; 0.75 stays 0.75)
-    return f"{x:.2f}"
-
 def parse_amount(s: str) -> Decimal:
-    # supports "1", "1.0", "1.00", etc
     return Decimal(s.strip())
 
+def fmt_money(x: Decimal) -> str:
+    return f"{x:.2f}"
+
 def main():
-    ap = argparse.ArgumentParser(description="Qibixx Cashless Slave: auto-approve vend requests (give credit to VMC)")
+    ap = argparse.ArgumentParser(description="Qibixx split-mode: Cashless Slave credit/approve VMC vend requests")
     ap.add_argument("--port", default=DEFAULT_PORT)
-    ap.add_argument("--sniff", action="store_true", help="Also enable sniffer X,1 (telemetry)")
-    ap.add_argument("--auto", action="store_true", help="Auto-approve every vend request")
-    ap.add_argument("--max-amount", default=None, help="Optional: deny if amount > this (e.g. 2.00)")
-    ap.add_argument("--allow-products", default=None, help="Optional: comma list of allowed product_ids (e.g. 2,5,10)")
-    ap.add_argument("--duration", type=int, default=0, help="Seconds to run (0 = forever)")
+    ap.add_argument("--auto", action="store_true", help="Auto-approve vend requests")
+    ap.add_argument("--max-amount", default=None, help="Deny if amount > this (e.g. 2.00)")
+    ap.add_argument("--allow-products", default=None, help="Comma list of allowed product_ids (e.g. 2,10)")
+    ap.add_argument("--duration", type=int, default=0, help="Seconds to run (0=forever)")
+    ap.add_argument("--debug-raw", action="store_true", help="Print all c,/x,/d, lines")
     args = ap.parse_args()
 
     max_amount = Decimal(args.max_amount) if args.max_amount else None
@@ -73,41 +67,40 @@ def main():
     with open_serial(args.port) as s:
         print("opened", args.port, "baud", BAUD, flush=True)
 
-        # Stop sniff (clean slate)
+        # Hard reset state: stop sniff, disable slave, clear buffers
         send(s, "X,0")
-        drain(s, 0.4)
+        send(s, "C,0")
+        time.sleep(0.2)
+        drain(s, 0.6)
 
         v = get_version(s)
         print("V ->", v if v else "(no version line)", flush=True)
 
-        # Enable cashless slave
-        # (If slave was previously enabled, you can optionally send C,0 first)
-        send(s, "C,0")
-        drain(s, 0.2)
+        # Enable cashless slave (device presented to VMC)
         send(s, "C,1")
         print("sent: C,1 (enable cashless slave)", flush=True)
 
-        if args.sniff:
-            send(s, "X,1")
-            print("sent: X,1 (enable sniffer)", flush=True)
-
-        # Wait until VMC enables the cashless device
+        # Wait for VMC to enable us: some firmwares print ENABLED, some go straight to IDLE
         enabled = False
         t0 = time.time()
-        while time.time() - t0 < 10:
+        while time.time() - t0 < 30:
             line = s.readline()
             if not line:
                 continue
             txt = clean_line(line)
-            if txt == "c,STATUS,ENABLED":
+            if args.debug_raw and txt:
+                if txt.startswith(("c,", "x,", "d,")):
+                    print(txt, flush=True)
+
+            if txt in ("c,STATUS,ENABLED", "c,STATUS,IDLE"):
                 enabled = True
+                print("✅ cashless slave active:", txt, flush=True)
                 break
-            # print chatter (optional)
-            if txt.startswith("c,") or txt.startswith("x,"):
-                print(txt, flush=True)
+
+            # Some units briefly say INACTIVE then later IDLE; keep waiting.
 
         if not enabled:
-            print("WARN: did not see c,STATUS,ENABLED within 10s; continuing anyway.", flush=True)
+            print("🛑 did not reach ENABLED/IDLE within 30s. If you see INACTIVE/DISABLED only, it's wiring/mode.", flush=True)
 
         print("=== waiting for vend requests from VMC ===", flush=True)
 
@@ -120,19 +113,22 @@ def main():
             line = s.readline()
             if not line:
                 continue
-
             txt = clean_line(line)
             if not txt:
                 continue
 
-            # Vend request from VMC (always-idle flow)
+            if args.debug_raw and txt.startswith(("c,", "x,", "d,")):
+                print(txt, flush=True)
+
+            # Vend request from VMC (always-idle style)
             m = VEND_REQ_RE.match(txt)
             if m:
                 amt_s, product_id = m.group(1), m.group(2)
+
                 try:
                     amt = parse_amount(amt_s)
                 except Exception:
-                    print(f"[{now_ms()}] got vend req but amount parse failed: {txt}", flush=True)
+                    print("🛑 amount parse failed:", txt, flush=True)
                     continue
 
                 decision = "APPROVE"
@@ -146,31 +142,25 @@ def main():
                     decision = "DENY"
                     reason = f"product {product_id} not allowed"
 
-                print(f"[{now_ms()}] VEND REQ amount={amt} product_id={product_id} -> {decision}"
+                print(f"🧠 VEND REQ amount=${fmt_money(amt)} product_id={product_id} -> {decision}"
                       + (f" ({reason})" if reason else ""), flush=True)
 
                 if args.auto and decision == "APPROVE":
-                    cmd = f"C,VEND,{decimal_str(amt)}"
+                    cmd = f"C,VEND,{fmt_money(amt)}"
                     send(s, cmd)
-                    print(f"sent: {cmd}", flush=True)
+                    print(f"😈 sent: {cmd}", flush=True)
                 else:
-                    # default behavior if not auto: deny to avoid accidental free vends
                     send(s, "C,STOP")
-                    print("sent: C,STOP (deny/cancel)", flush=True)
-
+                    print("🛑 sent: C,STOP", flush=True)
                 continue
 
-            # Completion / errors
+            # Completion
             if txt == "c,VEND,SUCCESS":
-                print(f"[{now_ms()}] VEND SUCCESS", flush=True)
+                print("🧾 VEND SUCCESS", flush=True)
                 continue
             if txt.startswith("c,ERR,VEND"):
-                print(f"[{now_ms()}] VEND ERROR: {txt}", flush=True)
+                print("🛑 VEND ERROR:", txt, flush=True)
                 continue
-
-            # Print relevant chatter
-            if txt.startswith(("c,", "x,", "r,")):
-                print(txt, flush=True)
 
         # Cleanup
         send(s, "X,0")
