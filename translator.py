@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
-  python3 translator.py --comp-credit 5.00 --comp-oneshot --debug
+  python3 translator.py --comp-credit .25 --comp-oneshot --debug
 """
 
 import serial, time, re, argparse, uuid
 from decimal import Decimal
 from pathlib import Path
 from api_client import api_post, get_device_credentials
+import signal, sys, atexit
 
 BAUD = 115200
 
@@ -220,6 +221,26 @@ def main():
     with serial.Serial(port, BAUD, timeout=0.3, write_timeout=0.3) as s:
         print("opened", port, flush=True)
 
+        def hard_cleanup():
+            try:
+                send(s, "C,STOP")
+                send(s, "D,END")
+                send(s, "D,STOP")
+                time.sleep(0.2)
+            except Exception:
+                pass
+
+        def handle_sigint(sig, frame):
+            hard_cleanup()
+            raise SystemExit(0)
+
+        signal.signal(signal.SIGINT, handle_sigint)
+        signal.signal(signal.SIGTERM, handle_sigint)
+        atexit.register(hard_cleanup)
+
+        # clean slate before init
+        hard_cleanup()
+
         if not init_vmc_slave(s, debug=args.debug):
             return
         if not init_nayax_master(s, debug=args.debug):
@@ -332,14 +353,6 @@ def main():
                 # Hard guard: never vend above current armed credit
                 if price > current_arm_amount():
                     print(f"🛑 price ${fmt_money(price)} > armed ${fmt_money(current_arm_amount())} -> C,STOP", flush=True)
-                    log_vend_event(
-                        api_base,
-                        "nayax_payment.denied",
-                        price,
-                        nayax_prod=current_vend_nayax_prod,
-                        reason=f"price_exceeds_armed_credit_{fmt_money(current_arm_amount())}",
-                        comp_mode=comp_active,
-                    )
                     send(s, "C,STOP")
                     vmc_busy = False
                     vmc_has_credit = False
