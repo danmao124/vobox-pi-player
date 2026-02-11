@@ -75,7 +75,7 @@ def log_vend_event(api_base: str, event_type: str, price: Decimal,
 
         data = {"price": str(price), "comp_mode": comp_mode}
         if nayax_prod is not None:
-            data["nayax_prod"] = nayax_prod
+            data["nayax_prod"] = int(nayax_prod)
         if reason:
             data["reason"] = reason
 
@@ -179,9 +179,8 @@ def main():
     ap.add_argument("--comp-oneshot", action="store_true",
                     help="If set with --comp-credit, disable comp mode after first successful vend.")
 
-    # robustness knobs
     ap.add_argument("--vmc-vend-timeout", type=float, default=25.0,
-                    help="Seconds to wait for c,VEND,SUCCESS before resetting cashless (avoids stuck busy).")
+                    help="Seconds to wait for c,VEND,SUCCESS before resetting cashless.")
     ap.add_argument("--credit-ttl", type=float, default=120.0,
                     help="Seconds after last IDLE,<credit> to treat credit as stale and re-arm.")
     args = ap.parse_args()
@@ -192,7 +191,6 @@ def main():
     with serial.Serial(port, BAUD, timeout=0.3, write_timeout=0.3) as s:
         print("opened", port, flush=True)
 
-        # --- graceful cleanup bound to THIS serial handle ---
         stop_flag = {"stop": False}
 
         def hard_cleanup():
@@ -211,7 +209,6 @@ def main():
         signal.signal(signal.SIGTERM, handle_sig)
         atexit.register(hard_cleanup)
 
-        # clean slate before init
         hard_cleanup()
 
         if not init_vmc_slave(s, debug=args.debug):
@@ -219,11 +216,11 @@ def main():
         if not init_nayax_master(s, debug=args.debug):
             return
 
-        # State
         vmc_has_credit = False
-        vmc_credit_ts = 0.0           # last time we saw IDLE,<credit>
+        vmc_credit_ts = 0.0
         vmc_busy = False
-        vmc_vend_deadline = 0.0       # vend watchdog deadline (especially for comp)
+        vmc_vend_deadline = 0.0
+
         awaiting_nayax = False
         pending = None
         nayax_deadline = 0.0
@@ -231,7 +228,7 @@ def main():
 
         # vend context for logging
         current_vend_price = None
-        current_vend_nayax_prod = None
+        current_vend_nayax_prod = None  # the computed byte (what we send to Nayax)
         current_vend_comp_mode = False
 
         def current_arm_amount() -> Decimal:
@@ -241,7 +238,6 @@ def main():
             nonlocal vmc_has_credit, vmc_credit_ts
             if vmc_busy or vmc_has_credit:
                 return
-            # normal mode requires Nayax CREDIT session
             if not comp_active and not nayax_credit_ready:
                 return
             ok = arm_credit_safe(s, current_arm_amount(), debug=args.debug)
@@ -255,31 +251,25 @@ def main():
 
         while not stop_flag["stop"]:
             line = s.readline()
-
             now = time.time()
 
-            # --- watchdogs & credit staleness even when no serial lines ---
-            # Expire stale credit (status can lie / session can drop silently)
             if vmc_has_credit and vmc_credit_ts and (now - vmc_credit_ts) > args.credit_ttl:
                 vmc_has_credit = False
 
-            # VMC vend watchdog: avoid being stuck busy forever if SUCCESS never arrives
             if vmc_busy and vmc_vend_deadline and now > vmc_vend_deadline:
                 print("🛑 VMC vend watchdog timeout -> C,STOP (reset busy)", flush=True)
                 send(s, "C,STOP")
+                send(s, "D,END")
                 vmc_busy = False
                 vmc_has_credit = False
                 vmc_credit_ts = 0.0
                 vmc_vend_deadline = 0.0
+                awaiting_nayax = False
+                pending = None
                 current_vend_price = None
                 current_vend_nayax_prod = None
                 current_vend_comp_mode = False
-                # also end Nayax just in case
-                send(s, "D,END")
-                awaiting_nayax = False
-                pending = None
 
-            # Nayax timeout watchdog (your existing behavior)
             if awaiting_nayax and now > nayax_deadline:
                 print("🛑 Nayax timeout -> C,STOP + D,END", flush=True)
                 if current_vend_price is not None:
@@ -360,7 +350,17 @@ def main():
                 price = parse_money(m_v.group(1))
                 vmc_prod_raw = m_v.group(2)
 
-                # Hard guard: never vend above current armed credit
+                # Compute a stable 0-255 selection byte for logging (and for Nayax in normal mode)
+                try:
+                    prod_int = int(vmc_prod_raw)
+                except Exception:
+                    prod_int = 0
+                selection_byte = prod_int & 0xFF
+
+                current_vend_price = price
+                current_vend_nayax_prod = selection_byte
+                current_vend_comp_mode = bool(comp_active)
+
                 if price > current_arm_amount():
                     print(f"🛑 price ${fmt_money(price)} > armed ${fmt_money(current_arm_amount())} -> C,STOP", flush=True)
                     send(s, "C,STOP")
@@ -368,20 +368,18 @@ def main():
                     vmc_has_credit = False
                     vmc_credit_ts = 0.0
                     vmc_vend_deadline = 0.0
+                    current_vend_price = None
+                    current_vend_nayax_prod = None
+                    current_vend_comp_mode = False
                     continue
 
-                # COMP MODE: skip Nayax and approve immediately
                 if comp_active:
-                    print(f"😈 COMP APPROVE -> C,VEND,{fmt_money(price)} (prod_raw={vmc_prod_raw})", flush=True)
-                    current_vend_price = price
-                    current_vend_nayax_prod = None
-                    current_vend_comp_mode = True
-
+                    print(f"😈 COMP APPROVE -> C,VEND,{fmt_money(price)} (sel={selection_byte})", flush=True)
                     send(s, f"C,VEND,{fmt_money(price)}")
                     vmc_vend_deadline = time.time() + args.vmc_vend_timeout
                     continue
 
-                # Normal mode: need Nayax CREDIT; wait briefly if needed
+                # Normal mode: wait briefly for CREDIT
                 if not nayax_credit_ready:
                     wait_until = time.time() + args.credit_wait
                     while time.time() < wait_until and not nayax_credit_ready:
@@ -402,6 +400,7 @@ def main():
                         api_base,
                         "nayax_payment.denied",
                         price,
+                        nayax_prod=selection_byte,
                         reason="no_nayax_credit_session",
                         comp_mode=False,
                     )
@@ -410,22 +409,14 @@ def main():
                     vmc_has_credit = False
                     vmc_credit_ts = 0.0
                     vmc_vend_deadline = 0.0
+                    current_vend_price = None
+                    current_vend_nayax_prod = None
+                    current_vend_comp_mode = False
                     continue
 
-                # Sanitize product for Nayax
-                try:
-                    prod_int = int(vmc_prod_raw)
-                except Exception:
-                    prod_int = 0
-                nayax_prod = prod_int & 0xFF
-
-                pending = (price, vmc_prod_raw, nayax_prod)
-                current_vend_price = price
-                current_vend_nayax_prod = nayax_prod
-                current_vend_comp_mode = False
-
-                cmd = f"D,REQ,{fmt_money(price)},{nayax_prod}"
-                print(f"🧠 VMC wants ${fmt_money(price)} prod_raw={vmc_prod_raw} -> {cmd}", flush=True)
+                pending = (price, selection_byte)
+                cmd = f"D,REQ,{fmt_money(price)},{selection_byte}"
+                print(f"🧠 VMC wants ${fmt_money(price)} -> {cmd}", flush=True)
                 send(s, cmd)
 
                 awaiting_nayax = True
@@ -437,13 +428,13 @@ def main():
             m_ne = N_ERR_RE.match(txt)
             if m_ne and awaiting_nayax and pending:
                 code = m_ne.group(1)
-                price, vmc_prod_raw, nayax_prod = pending
-                print(f"🛑 Nayax ERR {code} on D,REQ (prod={nayax_prod}, raw={vmc_prod_raw}) -> C,STOP", flush=True)
+                price, selection_byte = pending
+                print(f"🛑 Nayax ERR {code} on D,REQ (sel={selection_byte}) -> C,STOP", flush=True)
                 log_vend_event(
                     api_base,
                     "nayax_payment.denied",
                     price,
-                    nayax_prod=nayax_prod,
+                    nayax_prod=selection_byte,
                     reason=f"nayax_err_{code}",
                     comp_mode=False,
                 )
@@ -464,13 +455,10 @@ def main():
             m_nr = N_RESULT_RE.match(txt)
             if m_nr and awaiting_nayax and pending:
                 res = int(m_nr.group(1))
-                price, vmc_prod_raw, nayax_prod = pending
+                price, selection_byte = pending
 
                 if res == 1:
                     print(f"😈 Nayax approved -> C,VEND,{fmt_money(price)}", flush=True)
-                    current_vend_price = price
-                    current_vend_nayax_prod = nayax_prod
-                    current_vend_comp_mode = False
                     send(s, f"C,VEND,{fmt_money(price)}")
                     vmc_vend_deadline = time.time() + args.vmc_vend_timeout
                 else:
@@ -479,17 +467,16 @@ def main():
                         api_base,
                         "nayax_payment.denied",
                         price,
-                        nayax_prod=nayax_prod,
+                        nayax_prod=selection_byte,
                         reason=f"nayax_denied_res_{res}",
                         comp_mode=False,
                     )
                     send(s, "C,STOP")
+                    vmc_busy = False
+                    vmc_vend_deadline = 0.0
                     current_vend_price = None
                     current_vend_nayax_prod = None
                     current_vend_comp_mode = False
-                    # if denied, we're not actually waiting for SUCCESS
-                    vmc_busy = False
-                    vmc_vend_deadline = 0.0
 
                 send(s, "D,END")
                 awaiting_nayax = False
@@ -500,7 +487,6 @@ def main():
 
             maybe_arm()
 
-        # graceful stop
         print("👋 stopping (signal received)", flush=True)
         hard_cleanup()
 
