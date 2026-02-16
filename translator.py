@@ -225,6 +225,7 @@ def main():
         def hard_cleanup():
             try:
                 send(s, "C,STOP", debug=args.debug)
+                # Only END if a REQ might have been in-flight
                 send(s, "D,END", debug=args.debug)
                 send(s, "D,STOP", debug=args.debug)
                 time.sleep(0.2)
@@ -250,12 +251,15 @@ def main():
         vmc_vend_deadline = 0.0
 
         nayax_credit_ready = False
-        nayax_deadline = 0.0  # 0 means "not waiting"
+        nayax_deadline = 0.0  # 0 means "not waiting on Nayax RESULT/ERR"
 
         # vend context for logging / correlation
         current_vend_price = None
         current_vend_nayax_prod = None  # selection byte (0-255)
         current_vend_comp_mode = False
+
+        # "best of both worlds": cache last vend ctx for late ERRs (e.g. after watchdog reset)
+        last_ctx = {"price": None, "sel": None, "ts": 0.0}
 
         def reset_vend_state():
             nonlocal vmc_has_credit, vmc_busy, vmc_vend_deadline
@@ -292,13 +296,28 @@ def main():
             # VMC watchdog timeout
             if vmc_busy and vmc_vend_deadline and now > vmc_vend_deadline:
                 print("🛑 VMC vend watchdog timeout -> C,STOP (reset busy)", flush=True)
+
+                # preserve ctx for late ERR/RESULT chatter
+                if current_vend_price is not None:
+                    last_ctx["price"] = current_vend_price
+                    last_ctx["sel"] = current_vend_nayax_prod
+                    last_ctx["ts"] = time.time()
+
                 send(s, "C,STOP", debug=args.debug)
-                send(s, "D,END", debug=args.debug)
+                # only END if we were waiting on Nayax
+                if nayax_deadline > 0.0:
+                    send(s, "D,END", debug=args.debug)
                 reset_vend_state()
 
             # Nayax timeout (only meaningful if we're in a normal vend)
             if (nayax_deadline and now > nayax_deadline and vmc_busy
                 and (current_vend_price is not None) and (not current_vend_comp_mode)):
+
+                # preserve ctx
+                last_ctx["price"] = current_vend_price
+                last_ctx["sel"] = current_vend_nayax_prod
+                last_ctx["ts"] = time.time()
+
                 price = current_vend_price
                 sel = current_vend_nayax_prod
                 print("🛑 Nayax timeout -> C,STOP + D,END", flush=True)
@@ -375,6 +394,11 @@ def main():
                 current_vend_nayax_prod = selection_byte
                 current_vend_comp_mode = bool(comp_active)
 
+                # update last ctx so late ERRs still have info
+                last_ctx["price"] = price
+                last_ctx["sel"] = selection_byte
+                last_ctx["ts"] = time.time()
+
                 if price > current_arm_amount():
                     print(f"🛑 price ${fmt_money(price)} > armed ${fmt_money(current_arm_amount())} -> C,STOP", flush=True)
                     send(s, "C,STOP", debug=args.debug)
@@ -424,21 +448,41 @@ def main():
                 vmc_vend_deadline = time.time() + args.vmc_vend_timeout
                 continue
 
-            # Nayax ERR (only act if we're in an active normal vend)
+            # -----------------------------
+            # BEST-OF-BOTH-WORLDS: Nayax ERR
+            # - logs whenever we see ERR
+            # - uses live ctx; falls back to last ctx for late ERRs
+            # - aborts device-side state to prevent reconnect churn
+            # - only sends D,END if a REQ was actually in-flight
+            # -----------------------------
             m_ne = N_ERR_RE.match(txt)
-            if (m_ne):
+            if m_ne:
                 code = m_ne.group(1)
+
                 price = current_vend_price
                 sel = current_vend_nayax_prod
+                if price is None and (time.time() - last_ctx["ts"]) < 3.0:
+                    price = last_ctx["price"]
+                    sel = last_ctx["sel"]
 
-                log_vend_event(
-                    api_base,
-                    "nayax_payment.denied",
-                    price,
-                    nayax_prod=sel,
-                    reason=f"nayax_err_{code}",
-                    comp_mode=False,
-                )
+                if price is not None:
+                    log_vend_event(
+                        api_base,
+                        "nayax_payment.denied",
+                        price,
+                        nayax_prod=sel,
+                        reason=f"nayax_err_{code}",
+                        comp_mode=False,
+                    )
+                else:
+                    # keep it visible but avoid garbage logs
+                    print(f"⚠️ Nayax ERR {code} but no vend ctx available (not logging)", flush=True)
+
+                print(f"🛑 Nayax ERR {code} -> C,STOP + D,END", flush=True)
+
+                send(s, "C,STOP", debug=args.debug)
+                if nayax_deadline > 0.0:
+                    send(s, "D,END", debug=args.debug)
 
                 reset_vend_state()
                 continue
