@@ -186,7 +186,7 @@ def main():
         raise ValueError(f"Invalid MAX_CREDIT value in config.env: {max_credit_str}")
 
     ap = argparse.ArgumentParser()
-    ap.add_argument("--nayax-timeout", type=int, default=90)
+    ap.add_argument("--nayax-timeout", type=int, default=60)
     ap.add_argument("--credit-wait", type=float, default=6.0,
                     help="Seconds to wait for Nayax CREDIT after VMC VEND")
     ap.add_argument("--debug", action="store_true")
@@ -194,7 +194,7 @@ def main():
                     help="If set (e.g. 0.25), arm VMC with this credit and approve vends WITHOUT Nayax.")
     ap.add_argument("--comp-oneshot", action="store_true",
                     help="If set with --comp-credit, disable comp mode after first successful vend.")
-    ap.add_argument("--vmc-vend-timeout", type=float, default=25.0,
+    ap.add_argument("--vmc-vend-timeout", type=float, default=10.0,
                     help="Seconds to wait for c,VEND,SUCCESS before resetting cashless.")
                     
     args = ap.parse_args()
