@@ -52,7 +52,6 @@ if [[ -z "$DEVICE_SECRET" ]]; then
 fi
 
 # Build curl auth headers: X-Device-Id, X-Timestamp, X-Signature (HMAC-SHA256(secret, "timestamp.SHA256(body)"))
-# Call with body (e.g. empty for GET) before each request so timestamp is fresh.
 # Use only openssl (no xxd) so it works on minimal systems e.g. Raspberry Pi.
 build_curl_auth_headers() {
   local body="${1:-}"
