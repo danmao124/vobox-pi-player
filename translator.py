@@ -427,11 +427,15 @@ def main():
 
             # Nayax ERR (no in-flight state; only act if we're in an active normal vend)
             m_ne = N_ERR_RE.match(txt)
-            print(f"RAW txt repr={txt!r}", flush=True)
-            print(f"m_ne: {m_ne}", flush=True)
-            print(f"vmc_busy: {vmc_busy}", flush=True)
-            print(f"current_vend_price: {current_vend_price}", flush=True)
-            print(f"current_vend_comp_mode: {current_vend_comp_mode}", flush=True)
+            if (m_ne):
+                log_vend_event(
+                    api_base,
+                    "nayax_payment.denied",
+                    price,
+                    nayax_prod=sel,
+                    reason=f"nayax_err_{code}",
+                    comp_mode=False,
+                )
             if (m_ne and vmc_busy and (current_vend_price is not None) and (not current_vend_comp_mode)):
                 code = m_ne.group(1)
                 price = current_vend_price
