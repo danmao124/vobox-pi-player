@@ -433,6 +433,7 @@ def main():
             print(f"current_vend_price: {current_vend_price}", flush=True)
             print(f"current_vend_comp_mode: {current_vend_comp_mode}", flush=True)
             if (m_ne):
+                code = m_ne.group(1)
                 log_vend_event(
                     api_base,
                     "nayax_payment.denied",
