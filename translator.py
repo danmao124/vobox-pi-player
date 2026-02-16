@@ -427,6 +427,7 @@ def main():
 
             # Nayax ERR (no in-flight state; only act if we're in an active normal vend)
             m_ne = N_ERR_RE.match(txt)
+            print(f"RAW txt repr={txt!r}", flush=True)
             print(f"m_ne: {m_ne}", flush=True)
             print(f"vmc_busy: {vmc_busy}", flush=True)
             print(f"current_vend_price: {current_vend_price}", flush=True)
