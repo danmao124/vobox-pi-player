@@ -199,8 +199,15 @@ def main():
                     help="If set (e.g. 0.25), arm VMC with this credit and approve vends WITHOUT Nayax.")
     ap.add_argument("--comp-oneshot", action="store_true",
                     help="If set with --comp-credit, disable comp mode after first successful vend.")
-    ap.add_argument("--vmc-vend-timeout", type=float, default=25.0,
-                    help="Seconds to wait for c,VEND,SUCCESS before resetting cashless.")
+
+    # Two-stage watchdog:
+    # - vmc-vend-timeout (SOFT) preserves UX, does NOT abort
+    # - vmc-hard-timeout (HARD) aborts only if truly stuck
+    ap.add_argument("--vmc-vend-timeout", type=float, default=10.0,
+                    help="SOFT: seconds before we consider vend slow (no abort).")
+    ap.add_argument("--vmc-hard-timeout", type=float, default=35.0,
+                    help="HARD: seconds before we abort (C,STOP / D,END).")
+
     args = ap.parse_args()
 
     comp_credit = Decimal(args.comp_credit) if args.comp_credit is not None else None
@@ -225,7 +232,6 @@ def main():
         def hard_cleanup():
             try:
                 send(s, "C,STOP", debug=args.debug)
-                # Only END if a REQ might have been in-flight
                 send(s, "D,END", debug=args.debug)
                 send(s, "D,STOP", debug=args.debug)
                 time.sleep(0.2)
@@ -248,27 +254,29 @@ def main():
 
         vmc_has_credit = False
         vmc_busy = False
-        vmc_vend_deadline = 0.0
+        vmc_vend_deadline = 0.0   # soft deadline start time + args.vmc_vend_timeout
+        vmc_soft_warned = False
 
         nayax_credit_ready = False
-        nayax_deadline = 0.0  # 0 means "not waiting on Nayax RESULT/ERR"
+        nayax_deadline = 0.0      # 0 means "not waiting on Nayax RESULT/ERR"
 
         # vend context for logging / correlation
         current_vend_price = None
         current_vend_nayax_prod = None  # selection byte (0-255)
         current_vend_comp_mode = False
 
-        # "best of both worlds": cache last vend ctx for late ERRs (e.g. after watchdog reset)
+        # cache last vend ctx for late ERRs (e.g. after watchdog reset)
         last_ctx = {"price": None, "sel": None, "ts": 0.0}
 
         def reset_vend_state():
-            nonlocal vmc_has_credit, vmc_busy, vmc_vend_deadline
+            nonlocal vmc_has_credit, vmc_busy, vmc_vend_deadline, vmc_soft_warned
             nonlocal current_vend_price, current_vend_nayax_prod, current_vend_comp_mode
             nonlocal nayax_deadline
             nayax_deadline = 0.0
             vmc_busy = False
             vmc_has_credit = False
             vmc_vend_deadline = 0.0
+            vmc_soft_warned = False
             current_vend_price = None
             current_vend_nayax_prod = None
             current_vend_comp_mode = False
@@ -293,23 +301,32 @@ def main():
             line = s.readline()
             now = time.time()
 
-            # VMC watchdog timeout
-            if vmc_busy and vmc_vend_deadline and now > vmc_vend_deadline:
-                print("🛑 VMC vend watchdog timeout -> C,STOP (reset busy)", flush=True)
+            # ---------- two-stage VMC watchdog ----------
+            if vmc_busy and vmc_vend_deadline:
+                # SOFT watchdog (no abort)
+                if (not vmc_soft_warned) and now > vmc_vend_deadline:
+                    vmc_soft_warned = True
+                    # keep this silent for UX; uncomment if you want visibility
+                    # print("⏳ Vend taking >10s (soft watchdog) — not aborting yet", flush=True)
 
-                # preserve ctx for late ERR/RESULT chatter
-                if current_vend_price is not None:
-                    last_ctx["price"] = current_vend_price
-                    last_ctx["sel"] = current_vend_nayax_prod
-                    last_ctx["ts"] = time.time()
+                # HARD watchdog (abort)
+                hard_deadline = (vmc_vend_deadline - args.vmc_vend_timeout) + args.vmc_hard_timeout
+                if now > hard_deadline:
+                    print("🛑 Vend hard-timeout -> C,STOP (reset busy)", flush=True)
 
-                send(s, "C,STOP", debug=args.debug)
-                # only END if we were waiting on Nayax
-                if nayax_deadline > 0.0:
-                    send(s, "D,END", debug=args.debug)
-                reset_vend_state()
+                    # preserve ctx for late ERR/RESULT chatter
+                    if current_vend_price is not None:
+                        last_ctx["price"] = current_vend_price
+                        last_ctx["sel"] = current_vend_nayax_prod
+                        last_ctx["ts"] = time.time()
 
-            # Nayax timeout (only meaningful if we're in a normal vend)
+                    send(s, "C,STOP", debug=args.debug)
+                    # only END if we were actually waiting on Nayax response
+                    if nayax_deadline > 0.0:
+                        send(s, "D,END", debug=args.debug)
+                    reset_vend_state()
+
+            # ---------- Nayax timeout (only meaningful if we're in a normal vend) ----------
             if (nayax_deadline and now > nayax_deadline and vmc_busy
                 and (current_vend_price is not None) and (not current_vend_comp_mode)):
 
@@ -380,6 +397,8 @@ def main():
             m_v = VMC_VEND_RE.match(txt)
             if m_v:
                 vmc_busy = True
+                vmc_soft_warned = False
+
                 price = parse_money(m_v.group(1))
                 vmc_prod_raw = m_v.group(2)
 
@@ -475,7 +494,6 @@ def main():
                         comp_mode=False,
                     )
                 else:
-                    # keep it visible but avoid garbage logs
                     print(f"⚠️ Nayax ERR {code} but no vend ctx available (not logging)", flush=True)
 
                 print(f"🛑 Nayax ERR {code} -> C,STOP + D,END", flush=True)
