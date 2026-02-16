@@ -40,6 +40,29 @@ IMAGE_SECONDS="${IMAGE_SECONDS:-15}"
 MAX_CACHE_MB="${MAX_CACHE_MB:-30000}" # 30GB
 ORIENTATION="${ORIENTATION:-0}"  # Screen orientation: 0, 90, 180, or 270
 
+# Device auth (same as api_client.py): device_id = hostname, secret = /etc/machine-id
+DEVICE_ID="$(hostname)"
+DEVICE_SECRET=""
+if [[ -f /etc/machine-id ]]; then
+  DEVICE_SECRET="$(cat /etc/machine-id | tr -d '\n')"
+fi
+if [[ -z "$DEVICE_SECRET" ]]; then
+  echo "Missing or empty /etc/machine-id"
+  exit 1
+fi
+
+# Build curl auth headers: X-Device-Id, X-Timestamp, X-Signature (HMAC-SHA256(secret, "timestamp.SHA256(body)"))
+# Call with body (e.g. empty for GET) before each request so timestamp is fresh.
+build_curl_auth_headers() {
+  local body="${1:-}"
+  local timestamp body_hex canonical signature
+  timestamp="$(date +%s)"
+  body_hex="$(printf '%s' "$body" | openssl dgst -sha256 -binary | xxd -p -c 256 | tr -d '\n')"
+  canonical="${timestamp}.${body_hex}"
+  signature="$(printf '%s' "$canonical" | openssl dgst -sha256 -hmac "$DEVICE_SECRET" -binary | xxd -p -c 256 | tr -d '\n')"
+  curl_headers=(-H "X-Device-Id: $DEVICE_ID" -H "X-Timestamp: $timestamp" -H "X-Signature: $signature")
+}
+
 CURL_API_OPTS=(--fail --silent --show-error --connect-timeout 5 --max-time 10 -L)
 CURL_ASSET_OPTS=(--fail --silent --show-error --connect-timeout 5 --max-time 20 -L)
 JQ_URLS='.response.data[]?.url // empty'
@@ -67,11 +90,6 @@ ensure_dirs() {
   [[ -f "$PENDING_LIST" ]] || : > "$PENDING_LIST"
 }
 
-curl_headers=()
-if [[ "${AUTH_HEADER:-}" != "" ]]; then
-  curl_headers=(-H "$AUTH_HEADER")
-fi
-
 fetch_batch_to() {
   local idx="$1"
   local out="$2"
@@ -80,6 +98,7 @@ fetch_batch_to() {
   local url="${API_BASE}/${VIEW_PATH}?id=${ID}&index=${idx}"
   log "Fetch: $url"
 
+  build_curl_auth_headers ""
   local json
   if ! json="$(curl "${CURL_API_OPTS[@]}" "${curl_headers[@]}" "$url")"; then
     log "WARN: fetch failed"
@@ -120,6 +139,7 @@ cache_asset() {
     return 0
   fi
 
+  build_curl_auth_headers ""
   if curl "${CURL_ASSET_OPTS[@]}" "${curl_headers[@]}" -o "$tmp" "$url"; then
     mv -f "$tmp" "$path"
     printf '%s\n' "$path"
