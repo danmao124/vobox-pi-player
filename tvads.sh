@@ -53,13 +53,18 @@ fi
 
 # Build curl auth headers: X-Device-Id, X-Timestamp, X-Signature (HMAC-SHA256(secret, "timestamp.SHA256(body)"))
 # Call with body (e.g. empty for GET) before each request so timestamp is fresh.
+# Use only openssl (no xxd) so it works on minimal systems e.g. Raspberry Pi.
 build_curl_auth_headers() {
   local body="${1:-}"
   local timestamp body_hex canonical signature
   timestamp="$(date +%s)"
-  body_hex="$(printf '%s' "$body" | openssl dgst -sha256 -binary | xxd -p -c 256 | tr -d '\n')"
+  body_hex="$(printf '%s' "$body" | openssl dgst -sha256 -r | awk '{print $1}')"
   canonical="${timestamp}.${body_hex}"
-  signature="$(printf '%s' "$canonical" | openssl dgst -sha256 -hmac "$DEVICE_SECRET" -binary | xxd -p -c 256 | tr -d '\n')"
+  signature="$(printf '%s' "$canonical" | openssl dgst -sha256 -hmac "$DEVICE_SECRET" -r | awk '{print $1}')"
+  if [[ -z "$signature" ]]; then
+    echo "ERROR: failed to compute signature (openssl dgst -sha256 -hmac)" >&2
+    exit 1
+  fi
   curl_headers=(-H "x-device-id: $DEVICE_ID" -H "x-timestamp: $timestamp" -H "x-signature: $signature")
 }
 
