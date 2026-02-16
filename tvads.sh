@@ -60,7 +60,7 @@ build_curl_auth_headers() {
   body_hex="$(printf '%s' "$body" | openssl dgst -sha256 -binary | xxd -p -c 256 | tr -d '\n')"
   canonical="${timestamp}.${body_hex}"
   signature="$(printf '%s' "$canonical" | openssl dgst -sha256 -hmac "$DEVICE_SECRET" -binary | xxd -p -c 256 | tr -d '\n')"
-  curl_headers=(-H "X-Device-Id: $DEVICE_ID" -H "X-Timestamp: $timestamp" -H "X-Signature: $signature")
+  curl_headers=(-H "x-device-id: $DEVICE_ID" -H "x-timestamp: $timestamp" -H "x-signature: $signature")
 }
 
 CURL_API_OPTS=(--fail --silent --show-error --connect-timeout 5 --max-time 10 -L)
