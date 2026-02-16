@@ -21,12 +21,17 @@ N_OFF_RE            = re.compile(r"^d,STATUS,OFF\b")
 N_INIT_RE           = re.compile(r"^d,STATUS,INIT,(\d+)\b")
 N_IDLE_RE           = re.compile(r"^d,STATUS,IDLE\b")
 N_CREDIT_RE         = re.compile(r"^d,STATUS,CREDIT,([^,]+),(.+)$")
-N_RESULT_RE         = re.compile(r"^d,STATUS,RESULT,([-\d]+),([^,]+)")
-N_ERR_RE            = re.compile(r'^d,ERR,"([-\d]+)"\s*$')
+# tolerant: allow extra fields
+N_RESULT_RE         = re.compile(r'^[dD],STATUS,RESULT,([-\d]+),([^,\s]+)(?:,.*)?\s*$')
+# tolerant: allow missing quotes / extra fields / leading D
+N_ERR_RE            = re.compile(r'^[dD],ERR,["\']?([-\d]+)["\']?(?:,.*)?\s*$')
 
 # ---------- helpers ----------
 def clean(b: bytes) -> str:
-    return b.decode(errors="replace").strip()
+    # Drop embedded NULs; they break regex matches while looking “normal” when printed.
+    s = b.decode("utf-8", errors="replace")
+    s = s.replace("\x00", "")
+    return s.strip()
 
 def send(s: serial.Serial, cmd: str, retries: int = 3, debug: bool = False) -> bool:
     payload = (cmd + "\r\n").encode("ascii", errors="strict")
@@ -56,7 +61,7 @@ def parse_money(s: str) -> Decimal:
     return Decimal(s.strip())
 
 def debug_print(enabled: bool, txt: str):
-    if enabled and txt and txt[0] in ("c", "d", "x"):
+    if enabled and txt and txt[0] in ("c", "d", "x", "C", "D", "X"):
         print(txt, flush=True)
 
 def load_env_file(path: Path) -> dict:
@@ -194,9 +199,8 @@ def main():
                     help="If set (e.g. 0.25), arm VMC with this credit and approve vends WITHOUT Nayax.")
     ap.add_argument("--comp-oneshot", action="store_true",
                     help="If set with --comp-credit, disable comp mode after first successful vend.")
-    ap.add_argument("--vmc-vend-timeout", type=float, default=10.0,
+    ap.add_argument("--vmc-vend-timeout", type=float, default=25.0,
                     help="Seconds to wait for c,VEND,SUCCESS before resetting cashless.")
-                    
     args = ap.parse_args()
 
     comp_credit = Decimal(args.comp_credit) if args.comp_credit is not None else None
@@ -242,26 +246,24 @@ def main():
             return
 
         vmc_has_credit = False
-        vmc_credit_ts = 0.0
         vmc_busy = False
         vmc_vend_deadline = 0.0
 
         nayax_credit_ready = False
         nayax_deadline = 0.0  # 0 means "not waiting"
 
-        # vend context for logging
+        # vend context for logging / correlation
         current_vend_price = None
         current_vend_nayax_prod = None  # selection byte (0-255)
         current_vend_comp_mode = False
 
         def reset_vend_state():
-            nonlocal vmc_has_credit, vmc_credit_ts, vmc_busy, vmc_vend_deadline
+            nonlocal vmc_has_credit, vmc_busy, vmc_vend_deadline
             nonlocal current_vend_price, current_vend_nayax_prod, current_vend_comp_mode
             nonlocal nayax_deadline
             nayax_deadline = 0.0
             vmc_busy = False
             vmc_has_credit = False
-            vmc_credit_ts = 0.0
             vmc_vend_deadline = 0.0
             current_vend_price = None
             current_vend_nayax_prod = None
@@ -271,15 +273,13 @@ def main():
             return comp_credit if comp_active else max_credit
 
         def maybe_arm():
-            nonlocal vmc_has_credit, vmc_credit_ts
+            nonlocal vmc_has_credit
             if vmc_busy or vmc_has_credit:
                 return
             if not comp_active and not nayax_credit_ready:
                 return
             ok = arm_credit_safe(s, current_arm_amount(), debug=args.debug)
             vmc_has_credit = ok
-            if ok:
-                vmc_credit_ts = time.time()
 
         if comp_active:
             print(f"😈 COMP MODE ON: free credit=${fmt_money(comp_credit)} "
@@ -332,14 +332,13 @@ def main():
             # VMC credit state
             if VMC_IDLE_CREDIT_RE.match(txt):
                 vmc_has_credit = True
-                vmc_credit_ts = time.time()
             elif VMC_IDLE_RE.match(txt):
                 vmc_has_credit = False
             elif VMC_ENABLED_RE.match(txt):
                 if not vmc_busy:
                     vmc_has_credit = False
 
-            # Vend complete (this is where we log "approved" final truth)
+            # Vend complete (truth source)
             if txt == "c,VEND,SUCCESS":
                 print("🧾 VEND SUCCESS", flush=True)
                 if current_vend_price is not None:
@@ -425,37 +424,26 @@ def main():
                 vmc_vend_deadline = time.time() + args.vmc_vend_timeout
                 continue
 
-            # Nayax ERR (no in-flight state; only act if we're in an active normal vend)
+            # Nayax ERR (only act if we're in an active normal vend)
             m_ne = N_ERR_RE.match(txt)
-            print(f"RAW txt repr={txt!r}", flush=True)
-            print(f"m_ne: {m_ne}", flush=True)
-            print(f"vmc_busy: {vmc_busy}", flush=True)
-            print(f"current_vend_price: {current_vend_price}", flush=True)
-            print(f"current_vend_comp_mode: {current_vend_comp_mode}", flush=True)
             if (m_ne):
-                code = m_ne.group(1)
-                log_vend_event(
-                    api_base,
-                    "nayax_payment.denied",
-                    price,
-                    nayax_prod=current_vend_nayax_prod,
-                    reason=f"nayax_err_{code}",
-                    comp_mode=False,
-                )
-
-            if (m_ne and vmc_busy and (current_vend_price is not None) and (not current_vend_comp_mode)):
                 code = m_ne.group(1)
                 price = current_vend_price
                 sel = current_vend_nayax_prod
 
-                print(f"🛑 Nayax ERR {code} on D,REQ (sel={sel}) -> C,STOP", flush=True)
+                log_vend_event(
+                    api_base,
+                    "nayax_payment.denied",
+                    price,
+                    nayax_prod=sel,
+                    reason=f"nayax_err_{code}",
+                    comp_mode=False,
+                )
 
-                send(s, "C,STOP", debug=args.debug)
-                send(s, "D,END", debug=args.debug)
                 reset_vend_state()
                 continue
 
-            # Nayax RESULT (no in-flight state; only act if we're in an active normal vend)
+            # Nayax RESULT (only act if we're in an active normal vend)
             m_nr = N_RESULT_RE.match(txt)
             if (m_nr and vmc_busy and (current_vend_price is not None) and (not current_vend_comp_mode)):
                 res = int(m_nr.group(1))
