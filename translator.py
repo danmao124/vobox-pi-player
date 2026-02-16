@@ -437,7 +437,7 @@ def main():
                     api_base,
                     "nayax_payment.denied",
                     price,
-                    nayax_prod=sel,
+                    nayax_prod=current_vend_nayax_prod,
                     reason=f"nayax_err_{code}",
                     comp_mode=False,
                 )
