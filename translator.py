@@ -440,15 +440,6 @@ def main():
                 code = m_ne.group(1)
                 price = current_vend_price
                 sel = current_vend_nayax_prod
-
-                log_vend_event(
-                    api_base,
-                    "nayax_payment.denied",
-                    price,
-                    nayax_prod=sel,
-                    reason=f"nayax_err_{code}",
-                    comp_mode=False,
-                )
                 print(f"🛑 Nayax ERR {code} on D,REQ (sel={sel}) -> C,STOP", flush=True)
 
                 send(s, "C,STOP", debug=args.debug)
