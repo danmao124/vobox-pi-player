@@ -200,9 +200,9 @@ def main():
                     help="If set (e.g. 0.25), arm VMC with this credit and approve vends WITHOUT Nayax.")
     ap.add_argument("--comp-oneshot", action="store_true",
                     help="If set with --comp-credit, disable comp mode after first successful vend.")
-    ap.add_argument("--vmc-vend-timeout", type=float, default=10.0,
+    ap.add_argument("--vmc-vend-timeout", type=float, default=20.0,
                     help="Seconds to wait for c,VEND,SUCCESS before resetting cashless.")
-    ap.add_argument("--late-ctx-window", type=float, default=15.0,
+    ap.add_argument("--late-ctx-window", type=float, default=10.0,
                     help="Seconds after last vend trigger to accept late d,ERR as related.")
     args = ap.parse_args()
 
