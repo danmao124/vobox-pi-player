@@ -3,7 +3,7 @@
   python3 translator.py --comp-credit .25 --comp-oneshot --debug
 """
 
-import serial, time, re, argparse, uuid, signal, atexit
+import serial, time, re, argparse, uuid, signal, atexit, os
 from decimal import Decimal
 from pathlib import Path
 from api_client import api_post, get_device_credentials
@@ -34,25 +34,58 @@ def clean(b: bytes) -> str:
     s = s.replace("\x00", "")
     return s.strip()
 
-def send(s: serial.Serial, cmd: str, retries: int = 3, debug: bool = False) -> bool:
+def send(s: serial.Serial, cmd: str, retries: int = 4, debug: bool = False,
+         reopen_on_timeout: bool = True) -> bool:
+    """
+    Robust send:
+      - retries on SerialTimeoutException
+      - optionally reopens the port on timeout (CDC-ACM can wedge after boot)
+    """
     payload = (cmd + "\r\n").encode("ascii", errors="strict")
+    last_err = None
     for attempt in range(1, retries + 1):
         try:
             s.write(payload)
             s.flush()
             return True
-        except serial.SerialTimeoutException:
+        except serial.SerialTimeoutException as e:
+            last_err = e
             if debug:
                 print(f"⚠️ write timeout on '{cmd}' attempt {attempt}/{retries}", flush=True)
             try:
                 s.reset_output_buffer()
             except Exception:
                 pass
-            time.sleep(0.15)
+
+            # Boot race / wedged endpoint fix: close+open
+            if reopen_on_timeout:
+                try:
+                    port = s.port
+                    baud = s.baudrate
+                    to = s.timeout
+                    wt = s.write_timeout
+                    s.close()
+                    time.sleep(0.10)
+                    s.open()
+                    s.baudrate = baud
+                    s.timeout = to
+                    s.write_timeout = wt
+                    try:
+                        s.reset_input_buffer()
+                        s.reset_output_buffer()
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+
+            time.sleep(0.15 * attempt)
         except serial.SerialException as e:
+            last_err = e
             if debug:
                 print(f"⚠️ serial exception on '{cmd}': {e}", flush=True)
             break
+    if debug and last_err is not None:
+        print(f"⚠️ send failed for '{cmd}': {last_err}", flush=True)
     return False
 
 def fmt_money(x: Decimal) -> str:
@@ -111,6 +144,8 @@ def log_vend_event(api_base: str, event_type: str, price: Decimal,
 
 # ---------- init routines ----------
 def init_vmc_slave(s: serial.Serial, debug=False) -> bool:
+    # sometimes right after boot the first write blocks; give it a moment
+    time.sleep(0.4)
     if not send(s, "X,0", debug=debug): return False
     if not send(s, "C,0", debug=debug): return False
     time.sleep(0.2)
@@ -127,6 +162,7 @@ def init_vmc_slave(s: serial.Serial, debug=False) -> bool:
     return True
 
 def init_nayax_master(s: serial.Serial, debug=False) -> bool:
+    # best-effort cleanup; don't fail init if these miss
     send(s, "D,STOP", debug=debug)
     send(s, "D,0", debug=debug)
     ok = wait_for(s, N_OFF_RE, timeout_s=10, debug=debug)
@@ -215,6 +251,8 @@ def main():
         write_timeout=1.5,
         rtscts=False, dsrdtr=False, xonxoff=False
     ) as s:
+        # Give kernel/USB CDC a beat after open (boot race fix)
+        time.sleep(0.6)
         try:
             s.reset_input_buffer()
             s.reset_output_buffer()
@@ -226,9 +264,14 @@ def main():
         stop_flag = {"stop": False}
 
         def hard_cleanup():
+            """
+            Best-effort cleanup. Avoid hammering D,STOP unless needed.
+            If the port is wedged, send() will attempt reopen on timeouts.
+            """
             try:
                 send(s, "C,STOP", debug=args.debug)
                 send(s, "D,END", debug=args.debug)
+                # keep D,STOP but it's fine; comment out if you want gentler behavior
                 send(s, "D,STOP", debug=args.debug)
                 time.sleep(0.2)
             except Exception:
@@ -450,12 +493,10 @@ def main():
             if m_ne:
                 code = m_ne.group(1)
 
-                # Decide whether this ERR is related to a vend
                 have_live_ctx = (vmc_busy and (current_vend_price is not None) and (not current_vend_comp_mode))
                 have_recent_ctx = ((time.time() - last_ctx["ts"]) < args.late_ctx_window)
 
                 if not (have_live_ctx or have_recent_ctx):
-                    # Likely handshake noise; don't nuke the session
                     if args.debug:
                         print(f"⚠️ Nayax ERR {code} (no vend ctx) -> ignoring", flush=True)
                     continue
