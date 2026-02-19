@@ -226,6 +226,7 @@ start_mpv_if_needed() {
     --keep-open=always --keep-open-pause=no \
     --vo=gpu \
     --keepaspect=no \
+    --panscan=0 \
     --no-config \
     --reset-on-next-file=no \
     --video-rotate="$ORIENTATION" \
