@@ -225,6 +225,7 @@ start_mpv_if_needed() {
     --no-osc --cursor-autohide=always \
     --keep-open=always --keep-open-pause=no \
     --vo=gpu \
+    --panscan=1.0 \
     --reset-on-next-file=no \
     --video-rotate="$ORIENTATION" \
     --input-ipc-server="$MPV_SOCK" \
