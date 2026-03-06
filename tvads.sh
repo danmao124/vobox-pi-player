@@ -5,7 +5,7 @@ CONFIG="/data/player/config.env"
 STATE_DIR="/tmp/player/state"
 ASSET_DIR="/data/assets"
 
-MAIN_LIST="${STATE_DIR}/main.txt"
+MAIN_LIST="${ASSET_DIR}/main.txt"
 PENDING_LIST="${STATE_DIR}/pending.txt"
 INDEX_FILE="${STATE_DIR}/index.txt"
 NEXT_FILE="${STATE_DIR}/next.txt"
@@ -175,7 +175,7 @@ cleanup_cache() {
 
   log "Cache cleanup: ${used_mb}MB used, trimming to ${MAX_CACHE_MB}MB"
 
-  find "$ASSET_DIR" -type f -printf '%T@ %p\n' \
+  find "$ASSET_DIR" -type f ! -name 'main.txt' -printf '%T@ %p\n' \
     | sort -n \
     | while read -r _ file; do
         rm -f "$file"
@@ -318,14 +318,23 @@ play_url() {
 main() {
   ensure_dirs
 
-  local idx
   idx="$(cat "$INDEX_FILE" 2>/dev/null || echo "0")"
-  until fetch_batch_to "$idx" "$MAIN_LIST" "$NEXT_FILE"; do
-    log "Retry initial fetch in 5s..."
-    sleep 5
-    idx="$(cat "$INDEX_FILE" 2>/dev/null || echo "0")"
-  done
-  mv "$NEXT_FILE" "$INDEX_FILE"
+  if fetch_batch_to "$idx" "$PENDING_LIST" "$NEXT_FILE"; then
+    mv "$PENDING_LIST" "$MAIN_LIST"
+    mv "$NEXT_FILE" "$INDEX_FILE"
+  else
+    if [[ -s "$MAIN_LIST" ]]; then
+      log "Fetch failed at startup; using persisted MAIN_LIST"
+    else
+      log "No persisted MAIN_LIST; retrying initial fetch..."
+      until fetch_batch_to "$idx" "$PENDING_LIST" "$NEXT_FILE"; do
+        sleep 5
+        idx="$(cat "$INDEX_FILE" 2>/dev/null || echo "0")"
+      done
+      mv "$PENDING_LIST" "$MAIN_LIST"
+      mv "$NEXT_FILE" "$INDEX_FILE"
+    fi
+  fi
 
   background_fetch_pending & disown || true
 
@@ -335,7 +344,12 @@ main() {
     if [[ ! -s "$MAIN_LIST" ]]; then
       log "WARN: main list empty; refetching..."
       idx="$(cat "$INDEX_FILE" 2>/dev/null || echo "0")"
-      fetch_batch_to "$idx" "$MAIN_LIST" "$NEXT_FILE" && mv "$NEXT_FILE" "$INDEX_FILE" || sleep 2
+      if fetch_batch_to "$idx" "$PENDING_LIST" "$NEXT_FILE"; then
+        mv "$PENDING_LIST" "$MAIN_LIST"
+        mv "$NEXT_FILE" "$INDEX_FILE"
+      else
+        sleep 2
+      fi
       continue
     fi
 
