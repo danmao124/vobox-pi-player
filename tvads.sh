@@ -9,6 +9,7 @@ MAIN_LIST="${ASSET_DIR}/main.txt"
 PENDING_LIST="${STATE_DIR}/pending.txt"
 INDEX_FILE="${STATE_DIR}/index.txt"
 NEXT_FILE="${STATE_DIR}/next.txt"
+NEXT_BLAST_FILE="${STATE_DIR}/nextblast.txt"
 
 VIEW_PATH="view/billboard"
 
@@ -70,9 +71,12 @@ build_curl_auth_headers() {
 CURL_API_OPTS=(--fail --silent --show-error --connect-timeout 5 --max-time 10 -L)
 CURL_ASSET_OPTS=(--fail --silent --show-error --connect-timeout 5 --max-time 20 -L)
 JQ_URLS='.response.data[]?.url // empty'
-JQ_NEXT='.response.message // empty'
+JQ_INDEX='.response.index // .response.message // empty'
+JQ_BLAST='.response.blastIndex // empty'
 
 log(){ echo "[$(date '+%F %T')] $*"; }
+
+blast_idx=0
 
 # Strip CRLF, trailing whitespace, and trailing commas from URLs
 normalize_url() {
@@ -96,10 +100,12 @@ ensure_dirs() {
 
 fetch_batch_to() {
   local idx="$1"
-  local out="$2"
-  local nextfile="$3"
+  local blast_idx="$2"
+  local out="$3"
+  local nextfile="$4"
+  local nextblastfile="$5"
 
-  local url="${API_BASE}/${VIEW_PATH}?id=${ID}&index=${idx}"
+  local url="${API_BASE}/${VIEW_PATH}?id=${ID}&index=${idx}&blastIndex=${blast_idx}"
   log "Fetch: $url"
 
   build_curl_auth_headers ""
@@ -109,11 +115,12 @@ fetch_batch_to() {
     return 1
   fi
 
-  local urls next
+  local urls next next_blast
   # normalize lines coming from API (fixes "a.png," and CRLF issues)
   urls="$(jq -r "$JQ_URLS" <<<"$json" \
     | sed -E 's/\r$//; s/[[:space:]]+$//; s/,+$//; /^$/d' || true)"
-  next="$(jq -r "$JQ_NEXT" <<<"$json" | sed '/^$/d' || true)"
+  next="$(jq -r "$JQ_INDEX" <<<"$json" | sed '/^$/d' || true)"
+  next_blast="$(jq -r "$JQ_BLAST" <<<"$json" | sed '/^$/d' || true)"
 
   if [[ -z "$urls" ]]; then
     log "WARN: no urls in response"
@@ -122,7 +129,8 @@ fetch_batch_to() {
 
   printf "%s\n" "$urls" > "$out"
   [[ -n "$next" ]] && echo "$next" > "$nextfile" || echo "$idx" > "$nextfile"
-  log "OK: $(wc -l < "$out" | tr -d ' ') assets, nextIndex=$(cat "$nextfile")"
+  [[ -n "$next_blast" ]] && echo "$next_blast" > "$nextblastfile" || echo "$blast_idx" > "$nextblastfile"
+  log "OK: $(wc -l < "$out" | tr -d ' ') assets, nextIndex=$(cat "$nextfile") nextBlastIndex=$(cat "$nextblastfile")"
 }
 
 cache_path_for_url() {
@@ -156,12 +164,19 @@ cache_asset() {
 }
 
 background_fetch_pending() {
-  local idx
-  idx="$(cat "$INDEX_FILE" 2>/dev/null || echo "0")"
-  if fetch_batch_to "$idx" "$PENDING_LIST" "$NEXT_FILE"; then
+  local idx="$1"
+  local bidx="$2"
+  if fetch_batch_to "$idx" "$bidx" "$PENDING_LIST" "$NEXT_FILE" "$NEXT_BLAST_FILE"; then
     mv "$NEXT_FILE" "$INDEX_FILE"
   else
-    rm -f "$NEXT_FILE" || true
+    rm -f "$NEXT_FILE" "$NEXT_BLAST_FILE" || true
+  fi
+}
+
+read_next_blast_index() {
+  if [[ -f "$NEXT_BLAST_FILE" ]]; then
+    blast_idx="$(cat "$NEXT_BLAST_FILE")"
+    rm -f "$NEXT_BLAST_FILE"
   fi
 }
 
@@ -192,7 +207,8 @@ swap_pending_if_any() {
   fi
 
   cleanup_cache
-  background_fetch_pending & disown || true
+  read_next_blast_index
+  background_fetch_pending "$(cat "$INDEX_FILE" 2>/dev/null || echo "0")" "$blast_idx" & disown || true
 }
 
 # ---------------- mpv IPC ----------------
@@ -319,24 +335,26 @@ main() {
   ensure_dirs
 
   idx="$(cat "$INDEX_FILE" 2>/dev/null || echo "0")"
-  if fetch_batch_to "$idx" "$PENDING_LIST" "$NEXT_FILE"; then
+  if fetch_batch_to "$idx" "$blast_idx" "$PENDING_LIST" "$NEXT_FILE" "$NEXT_BLAST_FILE"; then
     mv "$PENDING_LIST" "$MAIN_LIST"
     mv "$NEXT_FILE" "$INDEX_FILE"
+    read_next_blast_index
   else
     if [[ -s "$MAIN_LIST" ]]; then
       log "Fetch failed at startup; using persisted MAIN_LIST"
     else
       log "No persisted MAIN_LIST; retrying initial fetch..."
-      until fetch_batch_to "$idx" "$PENDING_LIST" "$NEXT_FILE"; do
+      until fetch_batch_to "$idx" "$blast_idx" "$PENDING_LIST" "$NEXT_FILE" "$NEXT_BLAST_FILE"; do
         sleep 5
         idx="$(cat "$INDEX_FILE" 2>/dev/null || echo "0")"
       done
       mv "$PENDING_LIST" "$MAIN_LIST"
       mv "$NEXT_FILE" "$INDEX_FILE"
+      read_next_blast_index
     fi
   fi
 
-  background_fetch_pending & disown || true
+  background_fetch_pending "$(cat "$INDEX_FILE" 2>/dev/null || echo "0")" "$blast_idx" & disown || true
 
   start_mpv_if_needed
 
@@ -344,9 +362,10 @@ main() {
     if [[ ! -s "$MAIN_LIST" ]]; then
       log "WARN: main list empty; refetching..."
       idx="$(cat "$INDEX_FILE" 2>/dev/null || echo "0")"
-      if fetch_batch_to "$idx" "$PENDING_LIST" "$NEXT_FILE"; then
+      if fetch_batch_to "$idx" "$blast_idx" "$PENDING_LIST" "$NEXT_FILE" "$NEXT_BLAST_FILE"; then
         mv "$PENDING_LIST" "$MAIN_LIST"
         mv "$NEXT_FILE" "$INDEX_FILE"
+        read_next_blast_index
       else
         sleep 2
       fi
