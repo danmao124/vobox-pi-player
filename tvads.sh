@@ -10,6 +10,7 @@ PENDING_LIST="${STATE_DIR}/pending.txt"
 INDEX_FILE="${STATE_DIR}/index.txt"
 NEXT_FILE="${STATE_DIR}/next.txt"
 NEXT_BLAST_FILE="${STATE_DIR}/nextblast.txt"
+WEB_CONTENT_FILE="${STATE_DIR}/webcontent.txt"
 
 VIEW_PATH="view/billboard"
 
@@ -75,8 +76,6 @@ JQ_URLS='.response.data[]?.url // empty'
 JQ_INDEX='.response.index // .response.message // empty'
 JQ_BLAST='.response.blastIndex // empty'
 JQ_WEBCONTENT='.response.webContent // empty'
-
-WEB_CONTENT_FILE="${STATE_DIR}/webcontent.txt"
 
 log(){ echo "[$(date '+%F %T')] $*"; }
 
