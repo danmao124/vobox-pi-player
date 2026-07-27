@@ -367,26 +367,38 @@ launch_web_kiosk() {
 
   log "Launching Chromium kiosk: $kiosk_url"
 
-  # Run xset inside the X session so it can't race startx / miss XAUTHORITY.
-  # Also pass -s off to the X server so screensaver is disabled at startup.
-  startx /bin/bash -c "
-    xset s off
-    xset s noblank
-    xset -dpms
-    xset dpms 0 0 0
-    exec /usr/bin/chromium \
-      --kiosk \
-      --start-fullscreen \
-      --window-position=0,0 \
-      --window-size=1920,1080 \
-      --force-device-scale-factor=1 \
-      --noerrdialogs \
-      --no-first-run \
-      --disable-infobars \
-      --disable-session-crashed-bubble \
-      $(printf '%q' "$kiosk_url")
-  " -- :0 -nocursor -s off &
+  startx /usr/bin/chromium \
+    --kiosk \
+    --start-fullscreen \
+    --window-position=0,0 \
+    --window-size=1920,1080 \
+    --force-device-scale-factor=1 \
+    --noerrdialogs \
+    --no-first-run \
+    --disable-infobars \
+    --disable-session-crashed-bubble \
+    "$kiosk_url" \
+    -- :0 -nocursor -s off &
   CHROMIUM_PID=$!
+
+  # Wait for X to accept connections, then disable blanking/DPMS.
+  # (Immediate xset after startx races and silently fails.)
+  (
+    export DISPLAY=:0
+    export XAUTHORITY="${XAUTHORITY:-$HOME/.Xauthority}"
+    for _ in {1..50}; do
+      if xset q >/dev/null 2>&1; then
+        xset s off
+        xset s noblank
+        xset -dpms
+        xset dpms 0 0 0
+        log "Display blanking/DPMS disabled"
+        exit 0
+      fi
+      sleep 0.2
+    done
+    log "WARN: could not disable display blanking (X not ready)"
+  ) &
 }
 
 kill_web_kiosk() {
