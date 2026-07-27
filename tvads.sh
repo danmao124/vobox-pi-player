@@ -40,6 +40,7 @@ source "$CONFIG"
 IMAGE_SECONDS="${IMAGE_SECONDS:-15}"
 MAX_CACHE_MB="${MAX_CACHE_MB:-30000}" # 30GB
 ORIENTATION="${ORIENTATION:-0}"  # Screen orientation: 0, 90, 180, or 270
+WEB_STATION="${WEB_STATION:-}"  # Optional web station id
 
 # Device auth (same as api_client.py): device_id = hostname, secret = /etc/machine-id
 DEVICE_ID="$(hostname)"
@@ -73,6 +74,9 @@ CURL_ASSET_OPTS=(--fail --silent --show-error --connect-timeout 5 --max-time 20 
 JQ_URLS='.response.data[]?.url // empty'
 JQ_INDEX='.response.index // .response.message // empty'
 JQ_BLAST='.response.blastIndex // empty'
+JQ_WEBCONTENT='.response.webContent // empty'
+
+WEB_CONTENT_FILE="${STATE_DIR}/webcontent.txt"
 
 log(){ echo "[$(date '+%F %T')] $*"; }
 
@@ -106,6 +110,9 @@ fetch_batch_to() {
   local nextblastfile="$5"
 
   local url="${API_BASE}/${VIEW_PATH}?id=${ID}&index=${idx}&blastIndex=${blast_idx}"
+  if [[ -n "$WEB_STATION" ]]; then
+    url="${url}&webStationId=${WEB_STATION}"
+  fi
   log "Fetch: $url"
 
   build_curl_auth_headers ""
@@ -115,12 +122,19 @@ fetch_batch_to() {
     return 1
   fi
 
-  local urls next next_blast
+  local urls next next_blast web_content
   # normalize lines coming from API (fixes "a.png," and CRLF issues)
   urls="$(jq -r "$JQ_URLS" <<<"$json" \
     | sed -E 's/\r$//; s/[[:space:]]+$//; s/,+$//; /^$/d' || true)"
   next="$(jq -r "$JQ_INDEX" <<<"$json" | sed '/^$/d' || true)"
   next_blast="$(jq -r "$JQ_BLAST" <<<"$json" | sed '/^$/d' || true)"
+  web_content="$(jq -r "$JQ_WEBCONTENT" <<<"$json" | sed '/^$/d' || true)"
+
+  if [[ -n "$web_content" ]]; then
+    echo "$web_content" > "$WEB_CONTENT_FILE"
+  else
+    rm -f "$WEB_CONTENT_FILE"
+  fi
 
   if [[ -z "$urls" ]]; then
     log "WARN: no urls in response"
@@ -331,6 +345,55 @@ play_url() {
   fi
 }
 
+CHROMIUM_PID=""
+
+launch_web_kiosk() {
+  local web_content="$1"
+  local api_host
+  api_host="$(echo "$API_BASE" | sed -E 's|^https?://||; s|/.*||')"
+  local kiosk_url="https://${api_host}/player/${ORIENTATION}/${web_content}?id=${WEB_STATION}"
+
+  if [[ -n "$CHROMIUM_PID" ]] && kill -0 "$CHROMIUM_PID" 2>/dev/null; then
+    return 0
+  fi
+
+  log "Launching Chromium kiosk: $kiosk_url"
+
+  startx /usr/bin/chromium \
+    --kiosk \
+    --start-fullscreen \
+    --window-position=0,0 \
+    --window-size=1920,1080 \
+    --force-device-scale-factor=1 \
+    --noerrdialogs \
+    --no-first-run \
+    --disable-infobars \
+    --disable-session-crashed-bubble \
+    "$kiosk_url" \
+    -- :0 -nocursor &
+  CHROMIUM_PID=$!
+  DISPLAY=:0 XAUTHORITY="$HOME/.Xauthority" xset s off
+  DISPLAY=:0 XAUTHORITY="$HOME/.Xauthority" xset -dpms
+  DISPLAY=:0 XAUTHORITY="$HOME/.Xauthority" xset s noblank
+}
+
+kill_web_kiosk() {
+  if [[ -n "$CHROMIUM_PID" ]] && kill -0 "$CHROMIUM_PID" 2>/dev/null; then
+    log "Stopping Chromium kiosk"
+    kill "$CHROMIUM_PID" 2>/dev/null || true
+    wait "$CHROMIUM_PID" 2>/dev/null || true
+    CHROMIUM_PID=""
+  fi
+}
+
+sync_web_kiosk() {
+  if [[ -f "$WEB_CONTENT_FILE" ]]; then
+    launch_web_kiosk "$(cat "$WEB_CONTENT_FILE")"
+  else
+    kill_web_kiosk
+  fi
+}
+
 main() {
   ensure_dirs
 
@@ -354,6 +417,8 @@ main() {
     fi
   fi
 
+  sync_web_kiosk
+
   background_fetch_pending "$(cat "$INDEX_FILE" 2>/dev/null || echo "0")" "$blast_idx" & disown || true
 
   start_mpv_if_needed
@@ -367,8 +432,10 @@ main() {
         mv "$NEXT_FILE" "$INDEX_FILE"
         read_next_blast_index
       else
-        sleep 2
+        log "No images available; waiting 60s before retry..."
+        sleep 60
       fi
+      sync_web_kiosk
       continue
     fi
 
@@ -383,6 +450,7 @@ main() {
     done < "$MAIN_LIST"
 
     swap_pending_if_any
+    sync_web_kiosk
   done
 }
 
