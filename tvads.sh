@@ -367,22 +367,26 @@ launch_web_kiosk() {
 
   log "Launching Chromium kiosk: $kiosk_url"
 
-  startx /usr/bin/chromium \
-    --kiosk \
-    --start-fullscreen \
-    --window-position=0,0 \
-    --window-size=1920,1080 \
-    --force-device-scale-factor=1 \
-    --noerrdialogs \
-    --no-first-run \
-    --disable-infobars \
-    --disable-session-crashed-bubble \
-    "$kiosk_url" \
-    -- :0 -nocursor &
+  # Run xset inside the X session so it can't race startx / miss XAUTHORITY.
+  # Also pass -s off to the X server so screensaver is disabled at startup.
+  startx /bin/bash -c "
+    xset s off
+    xset s noblank
+    xset -dpms
+    xset dpms 0 0 0
+    exec /usr/bin/chromium \
+      --kiosk \
+      --start-fullscreen \
+      --window-position=0,0 \
+      --window-size=1920,1080 \
+      --force-device-scale-factor=1 \
+      --noerrdialogs \
+      --no-first-run \
+      --disable-infobars \
+      --disable-session-crashed-bubble \
+      $(printf '%q' "$kiosk_url")
+  " -- :0 -nocursor -s off &
   CHROMIUM_PID=$!
-  DISPLAY=:0 XAUTHORITY="$HOME/.Xauthority" xset s off
-  DISPLAY=:0 XAUTHORITY="$HOME/.Xauthority" xset -dpms
-  DISPLAY=:0 XAUTHORITY="$HOME/.Xauthority" xset s noblank
 }
 
 kill_web_kiosk() {
