@@ -16,6 +16,7 @@ VIEW_PATH="view/billboard"
 
 # mpv IPC socket (lives in RAM; fine)
 MPV_SOCK="/tmp/venditt-mpv.sock"
+CHROMIUM_PID=""
 
 cleanup() {
   # ask mpv to quit nicely; then hard kill if needed
@@ -24,6 +25,16 @@ cleanup() {
   fi
   pkill -f "input-ipc-server=$MPV_SOCK" >/dev/null 2>&1 || true
   rm -f "$MPV_SOCK" >/dev/null 2>&1 || true
+
+  # tear down chromium / X started by this script
+  if [[ -n "${CHROMIUM_PID:-}" ]]; then
+    kill "$CHROMIUM_PID" 2>/dev/null || true
+    wait "$CHROMIUM_PID" 2>/dev/null || true
+    CHROMIUM_PID=""
+  fi
+  pkill -f "/usr/bin/chromium" >/dev/null 2>&1 || true
+  pkill -f "X :0" >/dev/null 2>&1 || true
+  pkill -f "Xorg :0" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT INT TERM
 
@@ -344,8 +355,6 @@ play_url() {
   fi
 }
 
-CHROMIUM_PID=""
-
 launch_web_kiosk() {
   local web_content="$1"
   local api_host
@@ -383,6 +392,9 @@ kill_web_kiosk() {
     wait "$CHROMIUM_PID" 2>/dev/null || true
     CHROMIUM_PID=""
   fi
+  pkill -f "/usr/bin/chromium" >/dev/null 2>&1 || true
+  pkill -f "X :0" >/dev/null 2>&1 || true
+  pkill -f "Xorg :0" >/dev/null 2>&1 || true
 }
 
 sync_web_kiosk() {
