@@ -367,6 +367,8 @@ launch_web_kiosk() {
 
   log "Launching Chromium kiosk: $kiosk_url"
 
+  rm -rf ~/.cache/chromium ~/.config/chromium
+
   startx /usr/bin/chromium \
     --kiosk \
     --start-fullscreen \
