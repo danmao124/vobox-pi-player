@@ -11,6 +11,9 @@ INDEX_FILE="${STATE_DIR}/index.txt"
 NEXT_FILE="${STATE_DIR}/next.txt"
 NEXT_BLAST_FILE="${STATE_DIR}/nextblast.txt"
 WEB_CONTENT_FILE="${STATE_DIR}/webcontent.txt"
+# On disk so background (detached) fetches share the streak with the main loop
+FAIL_STREAK_FILE="${STATE_DIR}/failstreak.txt"
+RECOVERY_LOCK="${STATE_DIR}/recovery.lock"
 
 VIEW_PATH="view/billboard"
 
@@ -91,6 +94,7 @@ JQ_WEBCONTENT='.response.webContent // empty'
 log(){ echo "[$(date '+%F %T')] $*"; }
 
 blast_idx=0
+FETCH_FAIL_LIMIT=5
 
 # Strip CRLF, trailing whitespace, and trailing commas from URLs
 normalize_url() {
@@ -110,6 +114,95 @@ ensure_dirs() {
   [[ -f "$INDEX_FILE" ]] || echo "0" > "$INDEX_FILE"
   [[ -f "$MAIN_LIST"  ]] || : > "$MAIN_LIST"
   [[ -f "$PENDING_LIST" ]] || : > "$PENDING_LIST"
+  # No recovery can be in flight at startup; drop any lock left by a killed run
+  rm -rf "$RECOVERY_LOCK" >/dev/null 2>&1 || true
+  write_fail_streak 0
+}
+
+read_fail_streak() {
+  local n
+  n="$(cat "$FAIL_STREAK_FILE" 2>/dev/null || echo 0)"
+  [[ "$n" =~ ^[0-9]+$ ]] || n=0
+  printf '%s' "$n"
+}
+
+write_fail_streak() {
+  echo "$1" > "$FAIL_STREAK_FILE" 2>/dev/null || true
+}
+
+# After consecutive network-outage signals: bounce wlan0, else NetworkManager.
+# mkdir is atomic, so overlapping fetches can't run two recoveries at once.
+recover_network() {
+  if ! mkdir "$RECOVERY_LOCK" 2>/dev/null; then
+    log "Network recovery already in progress; skipping"
+    return 0
+  fi
+  local rc=0
+  run_network_recovery || rc=$?
+  rm -rf "$RECOVERY_LOCK" >/dev/null 2>&1 || true
+  return "$rc"
+}
+
+run_network_recovery() {
+  local out
+  log "WARN: network outage confirmed ${FETCH_FAIL_LIMIT}x in a row; recovering network"
+
+  log "Attempting wlan0 reset (down/up)..."
+  if out="$(ip link set wlan0 down 2>&1)"; then
+    [[ -n "$out" ]] && log "  wlan0 down: $out"
+    sleep 5
+    if out="$(ip link set wlan0 up 2>&1)"; then
+      [[ -n "$out" ]] && log "  wlan0 up: $out"
+      log "wlan0 reset OK; waiting 15s for link/DHCP..."
+      sleep 15
+      if internet_ping_ok; then
+        log "Network recovery via wlan0 complete (ping 8.8.8.8 OK)"
+        return 0
+      fi
+      log "WARN: wlan0 up succeeded but ping 8.8.8.8 still failing; escalating"
+    else
+      log "WARN: wlan0 up failed${out:+: $out}"
+    fi
+  else
+    log "WARN: wlan0 down failed${out:+: $out}"
+  fi
+
+  log "wlan0 reset did not restore connectivity; restarting NetworkManager..."
+  if out="$(systemctl restart NetworkManager 2>&1)"; then
+    [[ -n "$out" ]] && log "  nm: $out"
+    log "NetworkManager restarted; waiting 20s for connectivity..."
+    sleep 20
+    log "Network recovery via NetworkManager complete"
+    return 0
+  fi
+
+  log "ERROR: NetworkManager restart failed${out:+: $out}"
+  return 1
+}
+
+# Ping Google Public DNS — IP so we don't require working DNS to detect L3 outage
+internet_ping_ok() {
+  ping -c 1 -W 3 8.8.8.8 >/dev/null 2>&1
+}
+
+note_fetch_reach_failure() {
+  local reason="${1:-network outage}"
+  local streak
+  streak=$(( $(read_fail_streak) + 1 ))
+  write_fail_streak "$streak"
+  log "WARN: $reason (consecutive outage: ${streak}/${FETCH_FAIL_LIMIT})"
+  if (( streak >= FETCH_FAIL_LIMIT )); then
+    write_fail_streak 0
+    recover_network || true
+  fi
+}
+
+note_fetch_reach_ok() {
+  local streak
+  streak="$(read_fail_streak)"
+  (( streak > 0 )) || return 0
+  log "Network reachable again; clearing outage streak (was ${streak})"
+  write_fail_streak 0
 }
 
 fetch_batch_to() {
@@ -126,11 +219,18 @@ fetch_batch_to() {
   log "Fetch: $url"
 
   build_curl_auth_headers ""
-  local json
-  if ! json="$(curl "${CURL_API_OPTS[@]}" "${curl_headers[@]}" "$url")"; then
-    log "WARN: fetch failed"
+  local json curl_rc=0
+  json="$(curl "${CURL_API_OPTS[@]}" "${curl_headers[@]}" "$url")" || curl_rc=$?
+  if (( curl_rc != 0 )); then
+    log "WARN: fetch failed (curl rc=$curl_rc); checking Google (8.8.8.8)..."
+    if internet_ping_ok; then
+      log "Google reachable; treating as server/API issue (not network outage)"
+    else
+      note_fetch_reach_failure "API unreachable and ping 8.8.8.8 failed"
+    fi
     return 1
   fi
+  note_fetch_reach_ok
 
   local urls next next_blast web_content
   # normalize lines coming from API (fixes "a.png," and CRLF issues)
