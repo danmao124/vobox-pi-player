@@ -130,7 +130,7 @@ write_fail_streak() {
   echo "$1" > "$FAIL_STREAK_FILE" 2>/dev/null || true
 }
 
-# After consecutive network-outage signals: bounce wlan0, else NetworkManager.
+# After consecutive network-outage signals: nmcli reconnect wlan0, else NetworkManager.
 # mkdir is atomic, so overlapping fetches can't run two recoveries at once.
 recover_network() {
   if ! mkdir "$RECOVERY_LOCK" 2>/dev/null; then
@@ -147,27 +147,27 @@ run_network_recovery() {
   local out
   log "WARN: network outage confirmed ${FETCH_FAIL_LIMIT}x in a row; recovering network"
 
-  log "Attempting wlan0 reset (down/up)..."
-  if out="$(ip link set wlan0 down 2>&1)"; then
-    [[ -n "$out" ]] && log "  wlan0 down: $out"
+  log "Attempting wlan0 reconnect (nmcli disconnect/connect)..."
+  if out="$(nmcli device disconnect wlan0 2>&1)"; then
+    [[ -n "$out" ]] && log "  wlan0 disconnect: $out"
     sleep 5
-    if out="$(ip link set wlan0 up 2>&1)"; then
-      [[ -n "$out" ]] && log "  wlan0 up: $out"
-      log "wlan0 reset OK; waiting 15s for link/DHCP..."
+    if out="$(nmcli device connect wlan0 2>&1)"; then
+      [[ -n "$out" ]] && log "  wlan0 connect: $out"
+      log "wlan0 reconnect OK; waiting 15s for association/DHCP..."
       sleep 15
       if internet_ping_ok; then
         log "Network recovery via wlan0 complete (ping 8.8.8.8 OK)"
         return 0
       fi
-      log "WARN: wlan0 up succeeded but ping 8.8.8.8 still failing; escalating"
+      log "WARN: wlan0 connect succeeded but ping 8.8.8.8 still failing; escalating"
     else
-      log "WARN: wlan0 up failed${out:+: $out}"
+      log "WARN: wlan0 connect failed${out:+: $out}"
     fi
   else
-    log "WARN: wlan0 down failed${out:+: $out}"
+    log "WARN: wlan0 disconnect failed${out:+: $out}"
   fi
 
-  log "wlan0 reset did not restore connectivity; restarting NetworkManager..."
+  log "wlan0 reconnect did not restore connectivity; restarting NetworkManager..."
   if out="$(systemctl restart NetworkManager 2>&1)"; then
     [[ -n "$out" ]] && log "  nm: $out"
     log "NetworkManager restarted; waiting 20s for connectivity..."
