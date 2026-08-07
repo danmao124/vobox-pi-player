@@ -144,28 +144,32 @@ recover_network() {
 }
 
 run_network_recovery() {
-  local out
+  local out disc_rc=0
   log "WARN: network outage confirmed ${FETCH_FAIL_LIMIT}x in a row; recovering network"
 
   log "Attempting wlan0 reconnect (nmcli disconnect/connect)..."
-  if out="$(sudo -n nmcli device disconnect wlan0 2>&1)"; then
+  out="$(sudo -n nmcli device disconnect wlan0 2>&1)" || disc_rc=$?
+  if (( disc_rc == 0 )); then
     [[ -n "$out" ]] && log "  wlan0 disconnect: $out"
-    sleep 5
-    if out="$(sudo -n nmcli device connect wlan0 2>&1)"; then
-      [[ -n "$out" ]] && log "  wlan0 connect: $out"
-      log "wlan0 reconnect OK; waiting 15s for association/DHCP..."
-      sleep 15
-      if internet_ping_ok; then
-        log "Network recovery via wlan0 complete (ping 8.8.8.8 OK)"
-        restart_web_kiosk_if_needed
-        return 0
-      fi
-      log "WARN: wlan0 connect succeeded but ping 8.8.8.8 still failing; escalating"
-    else
-      log "WARN: wlan0 connect failed${out:+: $out}"
-    fi
+  elif grep -qiE 'not active|already disconnected' <<<"$out"; then
+    log "  wlan0 already inactive; proceeding to connect"
   else
     log "WARN: wlan0 disconnect failed${out:+: $out}"
+  fi
+  sleep 5
+
+  if out="$(sudo -n nmcli device connect wlan0 2>&1)"; then
+    [[ -n "$out" ]] && log "  wlan0 connect: $out"
+    log "wlan0 reconnect OK; waiting 15s for association/DHCP..."
+    sleep 15
+    if internet_ping_ok; then
+      log "Network recovery via wlan0 complete (ping 8.8.8.8 OK)"
+      restart_web_kiosk_if_needed
+      return 0
+    fi
+    log "WARN: wlan0 connect succeeded but ping 8.8.8.8 still failing; escalating"
+  else
+    log "WARN: wlan0 connect failed${out:+: $out}"
   fi
 
   log "wlan0 reconnect did not restore connectivity; restarting NetworkManager..."
