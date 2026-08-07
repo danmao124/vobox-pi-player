@@ -148,10 +148,10 @@ run_network_recovery() {
   log "WARN: network outage confirmed ${FETCH_FAIL_LIMIT}x in a row; recovering network"
 
   log "Attempting wlan0 reconnect (nmcli disconnect/connect)..."
-  if out="$(nmcli device disconnect wlan0 2>&1)"; then
+  if out="$(sudo -n nmcli device disconnect wlan0 2>&1)"; then
     [[ -n "$out" ]] && log "  wlan0 disconnect: $out"
     sleep 5
-    if out="$(nmcli device connect wlan0 2>&1)"; then
+    if out="$(sudo -n nmcli device connect wlan0 2>&1)"; then
       [[ -n "$out" ]] && log "  wlan0 connect: $out"
       log "wlan0 reconnect OK; waiting 15s for association/DHCP..."
       sleep 15
@@ -169,7 +169,7 @@ run_network_recovery() {
   fi
 
   log "wlan0 reconnect did not restore connectivity; restarting NetworkManager..."
-  if out="$(systemctl restart NetworkManager 2>&1)"; then
+  if out="$(sudo -n systemctl restart NetworkManager 2>&1)"; then
     [[ -n "$out" ]] && log "  nm: $out"
     log "NetworkManager restarted; waiting 20s for connectivity..."
     sleep 20
