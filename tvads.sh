@@ -94,7 +94,7 @@ JQ_WEBCONTENT='.response.webContent // empty'
 log(){ echo "[$(date '+%F %T')] $*"; }
 
 blast_idx=0
-FETCH_FAIL_LIMIT=2
+FETCH_FAIL_LIMIT=5
 
 # Strip CRLF, trailing whitespace, and trailing commas from URLs
 normalize_url() {
