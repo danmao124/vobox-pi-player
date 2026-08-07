@@ -157,6 +157,7 @@ run_network_recovery() {
       sleep 15
       if internet_ping_ok; then
         log "Network recovery via wlan0 complete (ping 8.8.8.8 OK)"
+        restart_web_kiosk_if_needed
         return 0
       fi
       log "WARN: wlan0 connect succeeded but ping 8.8.8.8 still failing; escalating"
@@ -173,6 +174,7 @@ run_network_recovery() {
     log "NetworkManager restarted; waiting 20s for connectivity..."
     sleep 20
     log "Network recovery via NetworkManager complete"
+    restart_web_kiosk_if_needed
     return 0
   fi
 
@@ -464,6 +466,10 @@ launch_web_kiosk() {
   if [[ -n "$CHROMIUM_PID" ]] && kill -0 "$CHROMIUM_PID" 2>/dev/null; then
     return 0
   fi
+  # Background network recovery may have already relaunched Chromium; don't start a second one.
+  if pgrep -f "/usr/bin/chromium" >/dev/null 2>&1; then
+    return 0
+  fi
 
   log "Launching Chromium kiosk: $kiosk_url"
 
@@ -513,6 +519,18 @@ kill_web_kiosk() {
   pkill -f "/usr/bin/chromium" >/dev/null 2>&1 || true
   pkill -f "X :0" >/dev/null 2>&1 || true
   pkill -f "Xorg :0" >/dev/null 2>&1 || true
+}
+
+# Force relaunch so a stuck offline/error page recovers after Wi-Fi comes back.
+# Safe from background fetch subshells (uses pkill; parent adopts via pgrep check above).
+restart_web_kiosk_if_needed() {
+  if [[ ! -f "$WEB_CONTENT_FILE" ]]; then
+    return 0
+  fi
+  log "Restarting Chromium kiosk after network recovery"
+  kill_web_kiosk
+  sleep 1
+  launch_web_kiosk "$(cat "$WEB_CONTENT_FILE")"
 }
 
 sync_web_kiosk() {
