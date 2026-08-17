@@ -352,69 +352,42 @@ mpv_running() {
   pgrep -f "input-ipc-server=$MPV_SOCK" >/dev/null 2>&1
 }
 
-# drm = exclusive KMS (no X). x11 = share display with Chromium kiosk.
-MPV_MODE=""
-
-desired_mpv_mode() {
-  if [[ -f "$WEB_CONTENT_FILE" ]] && x_display_running; then
-    printf '%s' "x11"
-  else
-    printf '%s' "drm"
-  fi
-}
-
+# mpv --vo=gpu grabs DRM exclusive; X cannot AddScreen until mpv releases it.
 stop_mpv() {
   if [[ -S "$MPV_SOCK" ]]; then
     printf '%s\n' '{"command":["quit"]}' | socat - UNIX-CONNECT:"$MPV_SOCK" >/dev/null 2>&1 || true
   fi
   pkill -f "input-ipc-server=$MPV_SOCK" >/dev/null 2>&1 || true
   rm -f "$MPV_SOCK" >/dev/null 2>&1 || true
-  MPV_MODE=""
   local _i
   for _i in {1..30}; do
     mpv_running || break
     sleep 0.1
   done
+  # Drop stale X lock files if a prior startx died hard
+  rm -f /tmp/.X0-lock /tmp/.X11-unix/X0 >/dev/null 2>&1 || true
 }
 
 start_mpv_if_needed() {
-  local mode
-  mode="$(desired_mpv_mode)"
-
-  if [[ -S "$MPV_SOCK" ]] && mpv_running && [[ "$MPV_MODE" == "$mode" ]]; then
-    if mpv_query '{"command":["get_property","idle-active"]}' | grep -q '"data"'; then
+  if [[ -S "$MPV_SOCK" ]]; then
+    if ! mpv_query '{"command":["get_property","idle-active"]}' | grep -q '"data"'; then
+      log "Stale mpv socket detected; restarting mpv"
+      stop_mpv
+    else
       return 0
     fi
-    log "Stale mpv socket detected; restarting mpv"
-    stop_mpv
-  elif mpv_running || [[ -S "$MPV_SOCK" ]]; then
-    # Mode change (e.g. kiosk came up) or half-dead process — restart
-    if [[ "$MPV_MODE" != "$mode" ]]; then
-      log "mpv mode ${MPV_MODE:-none} -> ${mode}; restarting"
-    fi
-    stop_mpv
   fi
 
   rm -f "$MPV_SOCK" || true
+  log "Starting mpv (persistent fullscreen, IPC, rotation=${ORIENTATION}°)"
 
-  local -a mpv_env=()
-  local -a mpv_vo=(--vo=gpu)
-  if [[ "$mode" == "x11" ]]; then
-    # Must not use raw DRM while X owns the display — that kills X within seconds.
-    mpv_env=(env "DISPLAY=:0" "XAUTHORITY=${XAUTHORITY:-$HOME/.Xauthority}")
-    mpv_vo=(--vo=x11)
-    log "Starting mpv on X :0 (x11 vo, rotation=${ORIENTATION}°)"
-  else
-    log "Starting mpv (DRM/gpu, rotation=${ORIENTATION}°)"
-  fi
-
-  "${mpv_env[@]}" mpv --fs --no-border --really-quiet \
+  mpv --fs --no-border --really-quiet \
     --hwdec=auto \
     --mute=yes --volume=0 \
     --idle=yes --force-window=yes \
     --no-osc --cursor-autohide=always \
     --keep-open=always --keep-open-pause=no \
-    "${mpv_vo[@]}" \
+    --vo=gpu \
     --keepaspect=no \
     --panscan=0 \
     --no-config \
@@ -425,10 +398,7 @@ start_mpv_if_needed() {
 
   # wait for socket
   for _ in {1..80}; do
-    if [[ -S "$MPV_SOCK" ]]; then
-      MPV_MODE="$mode"
-      return 0
-    fi
+    [[ -S "$MPV_SOCK" ]] && return 0
     sleep 0.1
   done
 
@@ -525,6 +495,7 @@ launch_web_kiosk() {
   local api_host
   api_host="$(echo "$API_BASE" | sed -E 's|^https?://||; s|/.*||')"
   local kiosk_url="https://${api_host}/player/${ORIENTATION}/${web_content}?id=${WEB_STATION}"
+  local need_mpv_restart=0
 
   if kiosk_startx_alive && chromium_running; then
     return 0
@@ -541,14 +512,14 @@ launch_web_kiosk() {
     sleep 1
   fi
 
-  # Raw DRM mpv blocks X from starting; release it first. We'll bring mpv back on X11.
+  # Startup order is X then mpv. On recovery mpv already owns DRM, so X fails with
+  # AddScreen/ScreenInit unless we release the display first.
   if mpv_running || [[ -S "$MPV_SOCK" ]]; then
-    log "Stopping mpv so X can claim the display"
+    log "Releasing mpv DRM so X can start"
     stop_mpv
+    need_mpv_restart=1
     sleep 1
   fi
-
-  rm -f /tmp/.X0-lock >/dev/null 2>&1 || true
 
   log "Launching Chromium kiosk: $kiosk_url"
 
@@ -570,7 +541,7 @@ launch_web_kiosk() {
     -- :0 -nocursor -s off &
   CHROMIUM_PID=$!
 
-  # Wait until X or Chromium is up before starting mpv on :0
+  # Wait until X or Chromium is up before giving DRM back to mpv
   local _i
   for _i in {1..50}; do
     if chromium_running || x_display_running; then
@@ -601,8 +572,9 @@ launch_web_kiosk() {
     log "WARN: could not disable display blanking (X not ready)"
   ) &
 
-  # Share the X display with Chromium (DRM vo would kill X again).
-  start_mpv_if_needed || true
+  if (( need_mpv_restart )); then
+    start_mpv_if_needed || true
+  fi
 }
 
 kill_web_kiosk() {
@@ -663,8 +635,6 @@ sync_web_kiosk() {
   else
     kill_web_kiosk
   fi
-  # Switch mpv between DRM (no kiosk) and X11 (kiosk) as needed
-  start_mpv_if_needed || true
 }
 
 main() {
