@@ -348,31 +348,12 @@ mpv_query() {
   printf '%s\n' "$1" | socat - UNIX-CONNECT:"$MPV_SOCK" 2>/dev/null || true
 }
 
-mpv_running() {
-  pgrep -f "input-ipc-server=$MPV_SOCK" >/dev/null 2>&1
-}
-
-# mpv --vo=gpu grabs DRM exclusive; X cannot AddScreen until mpv releases it.
-stop_mpv() {
-  if [[ -S "$MPV_SOCK" ]]; then
-    printf '%s\n' '{"command":["quit"]}' | socat - UNIX-CONNECT:"$MPV_SOCK" >/dev/null 2>&1 || true
-  fi
-  pkill -f "input-ipc-server=$MPV_SOCK" >/dev/null 2>&1 || true
-  rm -f "$MPV_SOCK" >/dev/null 2>&1 || true
-  local _i
-  for _i in {1..30}; do
-    mpv_running || break
-    sleep 0.1
-  done
-  # Drop stale X lock files if a prior startx died hard
-  rm -f /tmp/.X0-lock /tmp/.X11-unix/X0 >/dev/null 2>&1 || true
-}
-
 start_mpv_if_needed() {
   if [[ -S "$MPV_SOCK" ]]; then
     if ! mpv_query '{"command":["get_property","idle-active"]}' | grep -q '"data"'; then
       log "Stale mpv socket detected; restarting mpv"
-      stop_mpv
+      pkill -f "input-ipc-server=$MPV_SOCK" >/dev/null 2>&1 || true
+      rm -f "$MPV_SOCK" || true
     else
       return 0
     fi
@@ -495,7 +476,6 @@ launch_web_kiosk() {
   local api_host
   api_host="$(echo "$API_BASE" | sed -E 's|^https?://||; s|/.*||')"
   local kiosk_url="https://${api_host}/player/${ORIENTATION}/${web_content}?id=${WEB_STATION}"
-  local need_mpv_restart=0
 
   if kiosk_startx_alive && chromium_running; then
     return 0
@@ -509,15 +489,6 @@ launch_web_kiosk() {
   if x_display_running || kiosk_startx_alive; then
     log "WARN: Chromium not running but X/startx still present; clearing stale session"
     kill_web_kiosk
-    sleep 1
-  fi
-
-  # Startup order is X then mpv. On recovery mpv already owns DRM, so X fails with
-  # AddScreen/ScreenInit unless we release the display first.
-  if mpv_running || [[ -S "$MPV_SOCK" ]]; then
-    log "Releasing mpv DRM so X can start"
-    stop_mpv
-    need_mpv_restart=1
     sleep 1
   fi
 
@@ -541,18 +512,6 @@ launch_web_kiosk() {
     -- :0 -nocursor -s off &
   CHROMIUM_PID=$!
 
-  # Wait until X or Chromium is up before giving DRM back to mpv
-  local _i
-  for _i in {1..50}; do
-    if chromium_running || x_display_running; then
-      break
-    fi
-    sleep 0.2
-  done
-  if ! chromium_running; then
-    log "WARN: Chromium/X did not come up after startx"
-  fi
-
   # Wait for X to accept connections, then disable blanking/DPMS.
   # (Immediate xset after startx races and silently fails.)
   (
@@ -571,10 +530,6 @@ launch_web_kiosk() {
     done
     log "WARN: could not disable display blanking (X not ready)"
   ) &
-
-  if (( need_mpv_restart )); then
-    start_mpv_if_needed || true
-  fi
 }
 
 kill_web_kiosk() {
