@@ -20,6 +20,8 @@ VIEW_PATH="view/billboard"
 # mpv IPC socket (lives in RAM; fine)
 MPV_SOCK="/tmp/venditt-mpv.sock"
 CHROMIUM_PID=""
+# Top-level PID so background fetches can nuke the whole player for a clean systemd restart
+PLAYER_PID=$$
 
 cleanup() {
   # ask mpv to quit nicely; then hard kill if needed
@@ -542,23 +544,27 @@ kill_web_kiosk() {
   pkill -f "/usr/bin/chromium" >/dev/null 2>&1 || true
   pkill -f "X :0" >/dev/null 2>&1 || true
   pkill -f "Xorg :0" >/dev/null 2>&1 || true
-  # Brief wait so :0 is free before a relaunch
   sleep 0.5
 }
 
-# Force relaunch so a stuck offline/error page recovers after Wi-Fi comes back.
-# Safe from background fetch subshells (uses pkill; parent adopts via pgrep check above).
+# Full process restart: cleanup trap tears down mpv/X; systemd Restart= brings us back cold
+# (X then mpv) — avoids mid-run startx fighting DRM mpv.
+restart_player() {
+  local reason="${1:-kiosk unhealthy}"
+  log "WARN: $reason; exiting so systemd can restart the player"
+  kill -TERM "$PLAYER_PID" 2>/dev/null || exit 1
+  exit 1
+}
+
+# After Wi-Fi recovery, do a clean player restart rather than startx on a live DRM session.
 restart_web_kiosk_if_needed() {
   if [[ ! -f "$WEB_CONTENT_FILE" ]]; then
     return 0
   fi
-  log "Restarting Chromium kiosk after network recovery"
-  kill_web_kiosk
-  sleep 1
-  launch_web_kiosk "$(cat "$WEB_CONTENT_FILE")"
+  restart_player "network recovered; refreshing kiosk via full player restart"
 }
 
-# Watchdog: relaunch if Chromium died or X was orphaned.
+# Watchdog: if web content is expected and Chromium is gone, nuke the player process.
 ensure_web_kiosk_healthy() {
   if [[ ! -f "$WEB_CONTENT_FILE" ]]; then
     if chromium_running || x_display_running || kiosk_startx_alive; then
@@ -567,18 +573,10 @@ ensure_web_kiosk_healthy() {
     return 0
   fi
 
-  local web_content
-  web_content="$(cat "$WEB_CONTENT_FILE")"
-
   if ! chromium_running; then
-    log "WARN: Chromium kiosk not running (crash or exit); relaunching"
-    kill_web_kiosk
-    sleep 1
-    launch_web_kiosk "$web_content"
-    return 0
+    restart_player "Chromium kiosk not running (crash or exit)"
   fi
 
-  # startx died but Chromium somehow still up — adopt; next crash path cleans X
   if ! kiosk_startx_alive; then
     CHROMIUM_PID=""
   fi
