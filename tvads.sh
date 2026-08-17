@@ -564,22 +564,34 @@ restart_web_kiosk_if_needed() {
   restart_player "network recovered; refreshing kiosk via full player restart"
 }
 
-# Watchdog: if web content is expected and Chromium is gone, nuke the player process.
+# Set after the first intentional kiosk launch so "not running" means crash, not cold start.
+KIOSK_BOOTSTRAPPED=""
+
+# Watchdog: launch once at boot; if Chromium dies later, nuke the whole player.
 ensure_web_kiosk_healthy() {
   if [[ ! -f "$WEB_CONTENT_FILE" ]]; then
     if chromium_running || x_display_running || kiosk_startx_alive; then
       kill_web_kiosk
     fi
+    KIOSK_BOOTSTRAPPED=""
     return 0
   fi
 
-  if ! chromium_running; then
+  if chromium_running; then
+    KIOSK_BOOTSTRAPPED=1
+    if ! kiosk_startx_alive; then
+      CHROMIUM_PID=""
+    fi
+    return 0
+  fi
+
+  # Cold start / first sync: launch. Later syncs: Chromium was up before → full restart.
+  if [[ -n "$KIOSK_BOOTSTRAPPED" ]]; then
     restart_player "Chromium kiosk not running (crash or exit)"
   fi
 
-  if ! kiosk_startx_alive; then
-    CHROMIUM_PID=""
-  fi
+  launch_web_kiosk "$(cat "$WEB_CONTENT_FILE")"
+  KIOSK_BOOTSTRAPPED=1
 }
 
 sync_web_kiosk() {
@@ -587,6 +599,7 @@ sync_web_kiosk() {
     ensure_web_kiosk_healthy
   else
     kill_web_kiosk
+    KIOSK_BOOTSTRAPPED=""
   fi
 }
 
