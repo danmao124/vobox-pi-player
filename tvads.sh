@@ -357,6 +357,7 @@ start_mpv_if_needed() {
       pkill -f "input-ipc-server=$MPV_SOCK" >/dev/null 2>&1 || true
       rm -f "$MPV_SOCK" || true
     else
+      MPV_HAS_DISPLAY=1
       return 0
     fi
   fi
@@ -381,7 +382,10 @@ start_mpv_if_needed() {
 
   # wait for socket
   for _ in {1..80}; do
-    [[ -S "$MPV_SOCK" ]] && return 0
+    if [[ -S "$MPV_SOCK" ]]; then
+      MPV_HAS_DISPLAY=1
+      return 0
+    fi
     sleep 0.1
   done
 
@@ -566,6 +570,8 @@ restart_web_kiosk_if_needed() {
 
 # Set after the first intentional kiosk launch so "not running" means crash, not cold start.
 KIOSK_BOOTSTRAPPED=""
+# Set once mpv has taken DRM. Bringing Chromium up after that needs a full player restart.
+MPV_HAS_DISPLAY=""
 
 # Watchdog: launch once at boot; if Chromium dies later, nuke the whole player.
 ensure_web_kiosk_healthy() {
@@ -585,9 +591,13 @@ ensure_web_kiosk_healthy() {
     return 0
   fi
 
-  # Cold start / first sync: launch. Later syncs: Chromium was up before → full restart.
+  # Cold start (before mpv): launch X first. After mpv owns DRM, or if Chromium
+  # crashed, systemd restart gives a clean X-then-mpv boot — no startx fight.
   if [[ -n "$KIOSK_BOOTSTRAPPED" ]]; then
     restart_player "Chromium kiosk not running (crash or exit)"
+  fi
+  if [[ -n "$MPV_HAS_DISPLAY" ]]; then
+    restart_player "web content enabled; restarting player so kiosk can take the display"
   fi
 
   launch_web_kiosk "$(cat "$WEB_CONTENT_FILE")"
