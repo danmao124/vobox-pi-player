@@ -459,24 +459,44 @@ play_url() {
   fi
 }
 
+chromium_running() {
+  pgrep -f "/usr/bin/chromium" >/dev/null 2>&1
+}
+
+x_display_running() {
+  pgrep -f "X :0" >/dev/null 2>&1 || pgrep -f "Xorg :0" >/dev/null 2>&1
+}
+
+kiosk_startx_alive() {
+  [[ -n "${CHROMIUM_PID:-}" ]] && kill -0 "$CHROMIUM_PID" 2>/dev/null
+}
+
 launch_web_kiosk() {
   local web_content="$1"
   local api_host
   api_host="$(echo "$API_BASE" | sed -E 's|^https?://||; s|/.*||')"
   local kiosk_url="https://${api_host}/player/${ORIENTATION}/${web_content}?id=${WEB_STATION}"
 
-  if [[ -n "$CHROMIUM_PID" ]] && kill -0 "$CHROMIUM_PID" 2>/dev/null; then
+  if kiosk_startx_alive && chromium_running; then
     return 0
   fi
   # Background network recovery may have already relaunched Chromium; don't start a second one.
-  if pgrep -f "/usr/bin/chromium" >/dev/null 2>&1; then
+  if chromium_running; then
     return 0
+  fi
+
+  # Chromium gone but X still holding :0 — startx would fail until reboot without this.
+  if x_display_running || kiosk_startx_alive; then
+    log "WARN: Chromium not running but X/startx still present; clearing stale session"
+    kill_web_kiosk
+    sleep 1
   fi
 
   log "Launching Chromium kiosk: $kiosk_url"
 
   rm -rf ~/.cache/chromium ~/.config/chromium
 
+  # --disable-dev-shm-usage: Pi /dev/shm is often too small; Chromium crashes without it.
   startx /usr/bin/chromium \
     --kiosk \
     --start-fullscreen \
@@ -487,6 +507,7 @@ launch_web_kiosk() {
     --no-first-run \
     --disable-infobars \
     --disable-session-crashed-bubble \
+    --disable-dev-shm-usage \
     "$kiosk_url" \
     -- :0 -nocursor -s off &
   CHROMIUM_PID=$!
@@ -512,15 +533,17 @@ launch_web_kiosk() {
 }
 
 kill_web_kiosk() {
-  if [[ -n "$CHROMIUM_PID" ]] && kill -0 "$CHROMIUM_PID" 2>/dev/null; then
+  if kiosk_startx_alive; then
     log "Stopping Chromium kiosk"
     kill "$CHROMIUM_PID" 2>/dev/null || true
     wait "$CHROMIUM_PID" 2>/dev/null || true
-    CHROMIUM_PID=""
   fi
+  CHROMIUM_PID=""
   pkill -f "/usr/bin/chromium" >/dev/null 2>&1 || true
   pkill -f "X :0" >/dev/null 2>&1 || true
   pkill -f "Xorg :0" >/dev/null 2>&1 || true
+  # Brief wait so :0 is free before a relaunch
+  sleep 0.5
 }
 
 # Force relaunch so a stuck offline/error page recovers after Wi-Fi comes back.
@@ -535,9 +558,35 @@ restart_web_kiosk_if_needed() {
   launch_web_kiosk "$(cat "$WEB_CONTENT_FILE")"
 }
 
+# Watchdog: relaunch if Chromium died or X was orphaned.
+ensure_web_kiosk_healthy() {
+  if [[ ! -f "$WEB_CONTENT_FILE" ]]; then
+    if chromium_running || x_display_running || kiosk_startx_alive; then
+      kill_web_kiosk
+    fi
+    return 0
+  fi
+
+  local web_content
+  web_content="$(cat "$WEB_CONTENT_FILE")"
+
+  if ! chromium_running; then
+    log "WARN: Chromium kiosk not running (crash or exit); relaunching"
+    kill_web_kiosk
+    sleep 1
+    launch_web_kiosk "$web_content"
+    return 0
+  fi
+
+  # startx died but Chromium somehow still up — adopt; next crash path cleans X
+  if ! kiosk_startx_alive; then
+    CHROMIUM_PID=""
+  fi
+}
+
 sync_web_kiosk() {
   if [[ -f "$WEB_CONTENT_FILE" ]]; then
-    launch_web_kiosk "$(cat "$WEB_CONTENT_FILE")"
+    ensure_web_kiosk_healthy
   else
     kill_web_kiosk
   fi
