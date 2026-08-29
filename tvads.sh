@@ -481,7 +481,7 @@ launch_web_kiosk() {
   local web_content="$1"
   local api_host
   api_host="$(echo "$API_BASE" | sed -E 's|^https?://||; s|/.*||')"
-  local kiosk_url="https://${api_host}/player/${ORIENTATION}/${web_content}?id=${WEB_STATION}"
+  local kiosk_url="https://${api_host}/player/${ORIENTATION}/${web_content}?id=${WEB_STATION}&secret=${DEVICE_SECRET}"
 
   if kiosk_startx_alive && chromium_running; then
     return 0
