@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Interactive Wi-Fi setup via nmtui, then restart the player process.
+# Interactive Wi-Fi setup via nmtui, then tvstop/tvstart to restart the player.
 # Invoked by wifi_hotkey.sh on Ctrl+W. No systemd unit changes.
 #
 # Requires passwordless sudo for openvt, e.g. in /etc/sudoers.d/vobox-wifi:
@@ -91,10 +91,11 @@ else
   log "WARN: ping 8.8.8.8 still failing after wizard; restarting player for clean display"
 fi
 
-# Match tvads.sh restart_player: TERM the top-level player so systemd Restart=always brings it back.
-if [[ -n "$PLAYER_PID" ]] && kill -0 "$PLAYER_PID" 2>/dev/null; then
-  kill -TERM "$PLAYER_PID" 2>/dev/null || true
+log "Running tvstop..."
+tvstop
+log "Running tvstart..."
+if tvstart; then
   WIZARD_PLAYER_RESTARTED=1
 else
-  log "WARN: player PID $PLAYER_PID not running; nothing to restart"
+  log "WARN: tvstart failed"
 fi
