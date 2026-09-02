@@ -30,7 +30,7 @@ WIFI_HOTKEY_PID=""
 PLAYER_PID=$$
 
 cleanup() {
-  # stop Ctrl+W watcher first so it can't re-fire during teardown
+  # stop Ctrl+I watcher first so it can't re-fire during teardown
   if [[ -n "${WIFI_HOTKEY_PID:-}" ]]; then
     kill "$WIFI_HOTKEY_PID" 2>/dev/null || true
     wait "$WIFI_HOTKEY_PID" 2>/dev/null || true
@@ -134,7 +134,7 @@ ensure_dirs() {
   write_fail_streak 0
 }
 
-# Ctrl+W -> nmtui on a free VT -> restart player (see wifi_hotkey.sh / wifi_wizard.sh).
+# Ctrl+I -> nmtui on a free VT -> restart player (see wifi_hotkey.sh / wifi_wizard.sh).
 # No systemd unit changes; needs group `input` and passwordless sudo for openvt.
 start_wifi_hotkey() {
   if [[ ! -x "$WIFI_HOTKEY_SCRIPT" || ! -x "$WIFI_WIZARD_SCRIPT" ]]; then
@@ -147,7 +147,7 @@ start_wifi_hotkey() {
   "$WIFI_HOTKEY_SCRIPT" "$PLAYER_PID" "$WIFI_WIZARD_SCRIPT" "$WIZARD_LOCK" &
   WIFI_HOTKEY_PID=$!
   disown "$WIFI_HOTKEY_PID" 2>/dev/null || true
-  log "Wi-Fi hotkey watcher PID=$WIFI_HOTKEY_PID (Ctrl+W)"
+  log "Wi-Fi hotkey watcher PID=$WIFI_HOTKEY_PID (Ctrl+I)"
 }
 
 wizard_active() {

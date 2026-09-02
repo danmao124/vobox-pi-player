@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Watch /dev/input for Ctrl+W and launch the Wi-Fi wizard.
+# Watch /dev/input for Ctrl+I and launch the Wi-Fi wizard.
 # Started from tvads.sh (no systemd unit changes). Requires group `input`.
 set -euo pipefail
 
@@ -11,13 +11,13 @@ DEBOUNCE_SECS="${WIFI_HOTKEY_DEBOUNCE:-3}"
 log(){ echo "[$(date '+%F %T')] $*"; }
 
 if ! command -v python3 >/dev/null 2>&1; then
-  log "ERROR: python3 required for Ctrl+W Wi-Fi hotkey"
+  log "ERROR: python3 required for Ctrl+I Wi-Fi hotkey"
   exit 1
 fi
 
-log "Wi-Fi hotkey watcher started (Ctrl+W -> $WIZARD_SCRIPT)"
+log "Wi-Fi hotkey watcher started (Ctrl+I -> $WIZARD_SCRIPT)"
 
-# Stdlib-only evdev reader: tracks Left/Right Ctrl + W (KEY_W=17).
+# Stdlib-only evdev reader: tracks Left/Right Ctrl + I (KEY_I=23).
 exec python3 - "$PLAYER_PID" "$WIZARD_SCRIPT" "$WIZARD_LOCK" "$DEBOUNCE_SECS" <<'PY'
 import glob
 import os
@@ -34,7 +34,7 @@ debounce_secs = float(sys.argv[4])
 EV_KEY = 0x01
 KEY_LEFTCTRL = 29
 KEY_RIGHTCTRL = 97
-KEY_W = 17
+KEY_I = 23
 
 # struct input_event: timeval (2x long) + type + code + value
 fmt = "llHHi"
@@ -66,10 +66,10 @@ def fire_wizard() -> None:
     if now - last_fire < debounce_secs:
         return
     if os.path.isdir(wizard_lock):
-        log("Wi-Fi wizard already in progress; ignoring Ctrl+W")
+        log("Wi-Fi wizard already in progress; ignoring Ctrl+I")
         return
     last_fire = now
-    log("Ctrl+W detected; launching Wi-Fi wizard")
+    log("Ctrl+I detected; launching Wi-Fi wizard")
     try:
         subprocess.Popen(
             [wizard_script, str(player_pid)],
@@ -119,7 +119,7 @@ try:
                         ctrl_down = False
                     elif value == 1:
                         ctrl_down = True
-                elif code == KEY_W and value == 1 and ctrl_down:
+                elif code == KEY_I and value == 1 and ctrl_down:
                     fire_wizard()
 finally:
     for fd in fds:

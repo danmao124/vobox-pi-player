@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Interactive Wi-Fi setup via nmtui, then tvstop/tvstart to restart the player.
-# Invoked by wifi_hotkey.sh on Ctrl+W. No systemd unit changes.
+# Invoked by wifi_hotkey.sh on Ctrl+I. No systemd unit changes.
 #
 # Requires passwordless sudo for openvt, e.g. in /etc/sudoers.d/vobox-wifi:
 #   vobox ALL=(root) NOPASSWD: /usr/bin/openvt, /bin/openvt
@@ -41,7 +41,7 @@ if ! mkdir "$WIZARD_LOCK" 2>/dev/null; then
 fi
 trap on_wizard_exit EXIT
 
-log "Wi-Fi wizard requested (Ctrl+W)"
+log "Wi-Fi wizard requested (Ctrl+I)"
 
 ORIENTATION=0
 if [[ -f "$CONFIG" ]]; then
@@ -51,7 +51,7 @@ if [[ -f "$CONFIG" ]]; then
 fi
 FBCON_ROTATE="$(fbcon_rotate_from_orientation "$ORIENTATION")"
 
-# Free the display / DRM so openvt + nmtui are usable (and Chromium won't eat Ctrl+W).
+# Free the display / DRM so openvt + nmtui are usable (and Chromium won't eat Ctrl+I).
 if [[ -S "$MPV_SOCK" ]]; then
   printf '%s\n' '{"command":["quit"]}' | socat - UNIX-CONNECT:"$MPV_SOCK" >/dev/null 2>&1 || true
 fi
