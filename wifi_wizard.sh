@@ -29,11 +29,17 @@ release_lock() {
   rm -rf "$WIZARD_LOCK" >/dev/null 2>&1 || true
 }
 
+WIZARD_PLAYER_RESTARTED=0
+on_wizard_exit() {
+  # Successful path restarts the player; leave the lock for the new process to clear.
+  (( WIZARD_PLAYER_RESTARTED )) || release_lock
+}
+
 if ! mkdir "$WIZARD_LOCK" 2>/dev/null; then
   log "Wi-Fi wizard already in progress; skipping"
   exit 0
 fi
-trap release_lock EXIT
+trap on_wizard_exit EXIT
 
 log "Wi-Fi wizard requested (Ctrl+W)"
 
@@ -88,6 +94,7 @@ fi
 # Match tvads.sh restart_player: TERM the top-level player so systemd Restart=always brings it back.
 if [[ -n "$PLAYER_PID" ]] && kill -0 "$PLAYER_PID" 2>/dev/null; then
   kill -TERM "$PLAYER_PID" 2>/dev/null || true
+  WIZARD_PLAYER_RESTARTED=1
 else
   log "WARN: player PID $PLAYER_PID not running; nothing to restart"
 fi

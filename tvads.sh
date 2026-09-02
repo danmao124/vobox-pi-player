@@ -150,6 +150,21 @@ start_wifi_hotkey() {
   log "Wi-Fi hotkey watcher PID=$WIFI_HOTKEY_PID (Ctrl+W)"
 }
 
+wizard_active() {
+  [[ -d "$WIZARD_LOCK" ]]
+}
+
+# Wi-Fi wizard kills mpv/Chromium for nmtui; hold playback/kiosk until it restarts us.
+wait_while_wizard() {
+  if ! wizard_active; then
+    return 0
+  fi
+  log "Wi-Fi wizard active; pausing until player restart"
+  while wizard_active; do
+    sleep 1
+  done
+}
+
 read_fail_streak() {
   local n
   n="$(cat "$FAIL_STREAK_FILE" 2>/dev/null || echo 0)"
@@ -380,6 +395,8 @@ mpv_query() {
 }
 
 start_mpv_if_needed() {
+  wizard_active && return 0
+
   if [[ -S "$MPV_SOCK" ]]; then
     if ! mpv_query '{"command":["get_property","idle-active"]}' | grep -q '"data"'; then
       log "Stale mpv socket detected; restarting mpv"
@@ -444,6 +461,7 @@ mpv_wait_until_eof_with_timeout() {
   local max_ticks=$((timeout_secs * 5))  # 0.2s ticks => *5
 
   while true; do
+    wizard_active && return 0
     mpv_get_prop "eof-reached" | grep -q '"data":true' && return 0
     sleep 0.2
     ticks=$((ticks+1))
@@ -470,6 +488,8 @@ play_url() {
     return 0
   fi
 
+  wait_while_wizard
+
   start_mpv_if_needed
 
   if is_video "$url"; then
@@ -490,7 +510,12 @@ play_url() {
       mpv_wait_until_eof_with_timeout $((5 * 60))
     fi
   else
-    sleep "$IMAGE_SECONDS"
+    local i=0 ticks=$((IMAGE_SECONDS * 5))
+    while (( i < ticks )); do
+      wizard_active && return 0
+      sleep 0.2
+      i=$((i + 1))
+    done
   fi
 }
 
@@ -591,6 +616,7 @@ restart_player() {
 
 # After Wi-Fi recovery, do a clean player restart rather than startx on a live DRM session.
 restart_web_kiosk_if_needed() {
+  wizard_active && return 0
   if [[ ! -f "$WEB_CONTENT_FILE" ]]; then
     return 0
   fi
@@ -604,6 +630,8 @@ MPV_HAS_DISPLAY=""
 
 # Watchdog: launch once at boot; if Chromium dies later, nuke the whole player.
 ensure_web_kiosk_healthy() {
+  wizard_active && return 0
+
   if [[ ! -f "$WEB_CONTENT_FILE" ]]; then
     if chromium_running || x_display_running || kiosk_startx_alive; then
       kill_web_kiosk
@@ -634,6 +662,8 @@ ensure_web_kiosk_healthy() {
 }
 
 sync_web_kiosk() {
+  wizard_active && return 0
+
   if [[ -f "$WEB_CONTENT_FILE" ]]; then
     ensure_web_kiosk_healthy
   else
@@ -673,6 +703,8 @@ main() {
   start_mpv_if_needed
 
   while true; do
+    wait_while_wizard
+
     if [[ ! -s "$MAIN_LIST" ]]; then
       log "WARN: main list empty; refetching..."
       idx="$(cat "$INDEX_FILE" 2>/dev/null || echo "0")"
@@ -693,6 +725,7 @@ main() {
     log "Playing batch ($n items)"
 
     while IFS= read -r url; do
+      wait_while_wizard
       url="$(normalize_url "$url")"
       [[ -n "$url" ]] || continue
       play_url "$url"
