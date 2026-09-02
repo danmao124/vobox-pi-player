@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Interactive Wi-Fi setup via nmtui, then tvstop + reboot to restart the player.
+# Interactive Wi-Fi setup via nmtui, then tvstop/tvstart to restart the player.
 # Invoked by wifi_hotkey.sh on Ctrl+W. No systemd unit changes.
 #
-# Requires passwordless sudo for openvt and reboot, e.g. in /etc/sudoers.d/vobox-wifi:
-#   vobox ALL=(root) NOPASSWD: /usr/bin/openvt, /bin/openvt, /sbin/reboot, /usr/sbin/reboot
+# Requires passwordless sudo for openvt, e.g. in /etc/sudoers.d/vobox-wifi:
+#   vobox ALL=(root) NOPASSWD: /usr/bin/openvt, /bin/openvt
 set -euo pipefail
 
 PLAYER_PID="${1:?usage: wifi_wizard.sh PLAYER_PID}"
@@ -29,10 +29,10 @@ release_lock() {
   rm -rf "$WIZARD_LOCK" >/dev/null 2>&1 || true
 }
 
-WIZARD_REBOOTING=0
+WIZARD_PLAYER_RESTARTED=0
 on_wizard_exit() {
-  # Reboot clears everything; only release the lock if we didn't get that far.
-  (( WIZARD_REBOOTING )) || release_lock
+  # Successful path restarts the player; leave the lock for the new process to clear.
+  (( WIZARD_PLAYER_RESTARTED )) || release_lock
 }
 
 if ! mkdir "$WIZARD_LOCK" 2>/dev/null; then
@@ -93,7 +93,9 @@ fi
 
 log "Running tvstop..."
 tvstop
-release_lock
-log "Rebooting to restart player..."
-WIZARD_REBOOTING=1
-sudo -n reboot
+log "Running tvstart..."
+if tvstart; then
+  WIZARD_PLAYER_RESTARTED=1
+else
+  log "WARN: tvstart failed"
+fi
