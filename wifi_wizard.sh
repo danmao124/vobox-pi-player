@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Interactive Wi-Fi setup via nmtui, then tvstop/tvstart to restart the player.
+# Interactive Wi-Fi setup via nmtui, then restart the player (systemctl restart when under systemd).
 # Invoked by wifi_hotkey.sh on Ctrl+I. No systemd unit changes.
 #
-# Requires passwordless sudo for openvt, e.g. in /etc/sudoers.d/vobox-wifi:
-#   vobox ALL=(root) NOPASSWD: /usr/bin/openvt, /bin/openvt
+# Requires passwordless sudo, e.g. in /etc/sudoers.d/vobox-wifi:
+#   vobox ALL=(root) NOPASSWD: /usr/bin/openvt, /bin/openvt, /usr/bin/systemd-run, /usr/bin/systemctl
 set -euo pipefail
 
 PLAYER_PID="${1:?usage: wifi_wizard.sh PLAYER_PID}"
@@ -60,30 +60,95 @@ rm -f "$MPV_SOCK" >/dev/null 2>&1 || true
 pkill -f "/usr/bin/chromium" >/dev/null 2>&1 || true
 pkill -f "X :0" >/dev/null 2>&1 || true
 pkill -f "Xorg :0" >/dev/null 2>&1 || true
-sleep 0.5
+# Let mpv/Chromium release DRM before openvt grabs a VT.
+sleep 1
 
 internet_ping_ok() {
   ping -c 1 -W 3 8.8.8.8 >/dev/null 2>&1
+}
+
+launch_nmtui() {
+  local rotate="$1"
+  local nmtui_bin="$2"
+  local inner_cmd out=""
+
+  inner_cmd="echo ${rotate} > /sys/class/graphics/fbcon/rotate_all 2>/dev/null || true; exec \"${nmtui_bin}\""
+
+  log "Launching nmtui (orientation=${ORIENTATION}° / fbcon=${rotate})..."
+
+  # Processes in venditt-player.service cannot open /dev/tty0 ("Couldn't get a file
+  # descriptor referring to the console"). Run openvt in a transient unit instead.
+  if command -v systemd-run >/dev/null 2>&1; then
+    log "Trying systemd-run + openvt -f (outside service cgroup)..."
+    if out="$(sudo -n systemd-run \
+        --unit=vobox-wifi-nmtui \
+        --wait \
+        --collect \
+        --property=StandardInput=tty \
+        --property=StandardOutput=tty \
+        --property=TTYPath=/dev/tty2 \
+        --property=TTYReset=yes \
+        /usr/bin/openvt -f -s -w -- /bin/bash -c "$inner_cmd" \
+        2>&1)"; then
+      [[ -n "$out" ]] && log "  nmtui: $out"
+      log "nmtui exited"
+      return 0
+    fi
+    log "WARN: systemd-run + openvt failed${out:+: $out}"
+  fi
+
+  log "Trying openvt -f directly..."
+  if out="$(sudo -n openvt -f -s -w -- /bin/bash -c "$inner_cmd" 2>&1)"; then
+    [[ -n "$out" ]] && log "  openvt: $out"
+    log "nmtui exited"
+    return 0
+  fi
+
+  log "ERROR: openvt/nmtui failed${out:+: $out}"
+  log "HINT: passwordless sudo for openvt and systemd-run, e.g.:"
+  log "  vobox ALL=(root) NOPASSWD: /usr/bin/openvt, /bin/openvt, /usr/bin/systemd-run, /usr/bin/systemctl"
+  return 1
 }
 
 NMTUI_BIN="$(command -v nmtui || true)"
 if [[ -z "$NMTUI_BIN" ]]; then
   log "ERROR: nmtui not found; install network-manager / nmtui"
 else
-  log "Launching nmtui on a free VT (openvt, orientation=${ORIENTATION}° / fbcon=${FBCON_ROTATE})..."
-  # openvt runs as root: set fbcon rotate to match config.env, then nmtui.
-  # sudoers: NOPASSWD openvt (and bash so the wrapper can run)
-  if out="$(sudo -n openvt -s -w -- /bin/bash -c \
-    "echo ${FBCON_ROTATE} > /sys/class/graphics/fbcon/rotate_all 2>/dev/null || true; exec \"$NMTUI_BIN\"" \
-    2>&1)"; then
-    [[ -n "$out" ]] && log "  openvt: $out"
-    log "nmtui exited"
-  else
-    log "ERROR: openvt/nmtui failed${out:+: $out}"
-    log "HINT: allow passwordless sudo for openvt, e.g.:"
-    log "  vobox ALL=(root) NOPASSWD: /usr/bin/openvt, /bin/openvt"
-  fi
+  launch_nmtui "$FBCON_ROTATE" "$NMTUI_BIN" || true
 fi
+
+restart_player_after_wizard() {
+  local svc="${VENDITT_SERVICE:-venditt-player.service}"
+
+  # When tvads.sh runs under systemd, this wizard is in that unit's cgroup.
+  # tvstop then tvstart can stop the unit (killing us) before tvstart runs,
+  # leaving the player stopped — Restart=always does not restart explicit stops.
+  if command -v systemctl >/dev/null 2>&1 \
+      && systemctl is-active --quiet "$svc" 2>/dev/null; then
+    log "Restarting $svc (atomic systemctl restart)..."
+    if sudo -n systemctl restart "$svc" 2>/dev/null \
+        || systemctl restart "$svc" 2>/dev/null; then
+      WIZARD_PLAYER_RESTARTED=1
+      return 0
+    fi
+    log "WARN: systemctl restart failed; falling back to tvstop/tvstart"
+  fi
+
+  if command -v tvstop >/dev/null 2>&1 && command -v tvstart >/dev/null 2>&1; then
+    log "Running tvstop..."
+    tvstop
+    log "Running tvstart..."
+    if tvstart; then
+      WIZARD_PLAYER_RESTARTED=1
+      return 0
+    fi
+    log "WARN: tvstart failed"
+    return 1
+  fi
+
+  log "WARN: no restart helper; releasing wizard lock so tvads.sh can resume"
+  release_lock
+}
 
 if internet_ping_ok; then
   log "Network OK after wizard (ping 8.8.8.8); restarting player"
@@ -91,11 +156,4 @@ else
   log "WARN: ping 8.8.8.8 still failing after wizard; restarting player for clean display"
 fi
 
-log "Running tvstop..."
-tvstop
-log "Running tvstart..."
-if tvstart; then
-  WIZARD_PLAYER_RESTARTED=1
-else
-  log "WARN: tvstart failed"
-fi
+restart_player_after_wizard
