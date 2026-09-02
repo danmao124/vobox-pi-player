@@ -14,16 +14,29 @@ WEB_CONTENT_FILE="${STATE_DIR}/webcontent.txt"
 # On disk so background (detached) fetches share the streak with the main loop
 FAIL_STREAK_FILE="${STATE_DIR}/failstreak.txt"
 RECOVERY_LOCK="${STATE_DIR}/recovery.lock"
+WIZARD_LOCK="${STATE_DIR}/wizard.lock"
 
 VIEW_PATH="view/billboard"
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+WIFI_HOTKEY_SCRIPT="${SCRIPT_DIR}/wifi_hotkey.sh"
+WIFI_WIZARD_SCRIPT="${SCRIPT_DIR}/wifi_wizard.sh"
 
 # mpv IPC socket (lives in RAM; fine)
 MPV_SOCK="/tmp/venditt-mpv.sock"
 CHROMIUM_PID=""
+WIFI_HOTKEY_PID=""
 # Top-level PID so background fetches can nuke the whole player for a clean systemd restart
 PLAYER_PID=$$
 
 cleanup() {
+  # stop Ctrl+W watcher first so it can't re-fire during teardown
+  if [[ -n "${WIFI_HOTKEY_PID:-}" ]]; then
+    kill "$WIFI_HOTKEY_PID" 2>/dev/null || true
+    wait "$WIFI_HOTKEY_PID" 2>/dev/null || true
+    WIFI_HOTKEY_PID=""
+  fi
+
   # ask mpv to quit nicely; then hard kill if needed
   if [[ -S "$MPV_SOCK" ]]; then
     printf '%s\n' '{"command":["quit"]}' | socat - UNIX-CONNECT:"$MPV_SOCK" >/dev/null 2>&1 || true
@@ -87,7 +100,7 @@ build_curl_auth_headers() {
 }
 
 CURL_API_OPTS=(--fail --silent --show-error --connect-timeout 5 --max-time 10 -L)
-CURL_ASSET_OPTS=(--fail --silent --show-error --connect-timeout 5 --max-time 20 -L)
+CURL_ASSET_OPTS=(--fail --silent --show-error --connect-timeout 5 --max-time 900 -L)
 JQ_URLS='.response.data[]?.url // empty'
 JQ_INDEX='.response.index // .response.message // empty'
 JQ_BLAST='.response.blastIndex // empty'
@@ -116,9 +129,25 @@ ensure_dirs() {
   [[ -f "$INDEX_FILE" ]] || echo "0" > "$INDEX_FILE"
   [[ -f "$MAIN_LIST"  ]] || : > "$MAIN_LIST"
   [[ -f "$PENDING_LIST" ]] || : > "$PENDING_LIST"
-  # No recovery can be in flight at startup; drop any lock left by a killed run
-  rm -rf "$RECOVERY_LOCK" >/dev/null 2>&1 || true
+  # No recovery/wizard can be in flight at startup; drop locks left by a killed run
+  rm -rf "$RECOVERY_LOCK" "$WIZARD_LOCK" >/dev/null 2>&1 || true
   write_fail_streak 0
+}
+
+# Ctrl+W -> nmtui on a free VT -> restart player (see wifi_hotkey.sh / wifi_wizard.sh).
+# No systemd unit changes; needs group `input` and passwordless sudo for openvt.
+start_wifi_hotkey() {
+  if [[ ! -x "$WIFI_HOTKEY_SCRIPT" || ! -x "$WIFI_WIZARD_SCRIPT" ]]; then
+    log "WARN: Wi-Fi hotkey scripts missing or not executable (${WIFI_HOTKEY_SCRIPT}, ${WIFI_WIZARD_SCRIPT})"
+    return 0
+  fi
+  if [[ -n "${WIFI_HOTKEY_PID:-}" ]] && kill -0 "$WIFI_HOTKEY_PID" 2>/dev/null; then
+    return 0
+  fi
+  "$WIFI_HOTKEY_SCRIPT" "$PLAYER_PID" "$WIFI_WIZARD_SCRIPT" "$WIZARD_LOCK" &
+  WIFI_HOTKEY_PID=$!
+  disown "$WIFI_HOTKEY_PID" 2>/dev/null || true
+  log "Wi-Fi hotkey watcher PID=$WIFI_HOTKEY_PID (Ctrl+W)"
 }
 
 read_fail_streak() {
@@ -615,6 +644,7 @@ sync_web_kiosk() {
 
 main() {
   ensure_dirs
+  start_wifi_hotkey
 
   idx="$(cat "$INDEX_FILE" 2>/dev/null || echo "0")"
   if fetch_batch_to "$idx" "$blast_idx" "$PENDING_LIST" "$NEXT_FILE" "$NEXT_BLAST_FILE"; then
