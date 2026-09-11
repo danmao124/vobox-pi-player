@@ -100,7 +100,7 @@ build_curl_auth_headers() {
 }
 
 CURL_API_OPTS=(--fail --silent --show-error --connect-timeout 5 --max-time 10 -L)
-CURL_ASSET_OPTS=(--fail --silent --show-error --connect-timeout 5 --max-time 900 -L)
+CURL_ASSET_OPTS=(--fail --silent --show-error --connect-timeout 5 --max-time 500 -L)
 JQ_URLS='.response.data[]?.url // empty'
 JQ_INDEX='.response.index // .response.message // empty'
 JQ_BLAST='.response.blastIndex // empty'
@@ -109,7 +109,7 @@ JQ_WEBCONTENT='.response.webContent // empty'
 log(){ echo "[$(date '+%F %T')] $*"; }
 
 blast_idx=0
-FETCH_FAIL_LIMIT=5
+FETCH_FAIL_LIMIT=3
 
 # Strip CRLF, trailing whitespace, and trailing commas from URLs
 normalize_url() {
@@ -314,27 +314,102 @@ cache_path_for_url() {
   echo "${ASSET_DIR}/${filename}"
 }
 
-cache_asset() {
+asset_lock_path() {
+  echo "$(cache_path_for_url "$1").lock"
+}
+
+asset_download_in_progress() {
+  local lock pid
+  lock="$(asset_lock_path "$1")"
+  [[ -f "$lock" ]] || return 1
+  pid="$(cat "$lock" 2>/dev/null || true)"
+  [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null
+}
+
+# Kill hung/in-flight asset curls so a dead Wi-Fi doesn't pin the batch for max-time.
+abort_in_flight_asset_downloads() {
+  local lock pid tmp
+  for lock in "$ASSET_DIR"/*.lock; do
+    [[ -f "$lock" ]] || continue
+    pid="$(cat "$lock" 2>/dev/null || true)"
+    tmp="${lock%.lock}.tmp"
+    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+      log "Aborting asset download pid=$pid"
+      kill "$pid" 2>/dev/null || true
+    fi
+    rm -f "$lock" "$tmp" >/dev/null 2>&1 || true
+  done
+}
+
+# Kick off a non-blocking download if needed. Never blocks the play loop.
+start_asset_download_bg() {
   local url="$1"
-  local path tmp
+  local path tmp lock
   path="$(cache_path_for_url "$url")"
   tmp="${path}.tmp"
+  lock="$(asset_lock_path "$url")"
+
+  [[ -s "$path" ]] && return 0
+  if asset_download_in_progress "$url"; then
+    return 0
+  fi
+
+  # Stale lock / leftover partial from a previous crash
+  rm -f "$lock" "$tmp" >/dev/null 2>&1 || true
+
+  (
+    set +e
+    local curl_pid rc=1
+    build_curl_auth_headers ""
+    curl "${CURL_ASSET_OPTS[@]}" "${curl_headers[@]}" -o "$tmp" "$url" &
+    curl_pid=$!
+    echo "$curl_pid" > "$lock"
+    trap 'rm -f "$lock"' EXIT
+    wait "$curl_pid"
+    rc=$?
+    if (( rc == 0 )); then
+      mv -f "$tmp" "$path"
+      log "OK: downloaded $(basename "$path")"
+      note_fetch_reach_ok
+    else
+      rm -f "$tmp" >/dev/null 2>&1 || true
+      log "WARN: download failed: $url"
+      if internet_ping_ok; then
+        log "Google reachable; treating asset failure as server/CDN issue"
+      else
+        note_fetch_reach_failure "asset download failed and ping 8.8.8.8 failed"
+      fi
+    fi
+  ) &
+  disown || true
+  log "Queued download: $url"
+}
+
+batch_has_downloads_in_progress() {
+  local url
+  [[ -s "$MAIN_LIST" ]] || return 1
+  while IFS= read -r url; do
+    url="$(normalize_url "$url")"
+    [[ -n "$url" ]] || continue
+    asset_download_in_progress "$url" && return 0
+  done < "$MAIN_LIST"
+  return 1
+}
+
+# Ready path on stdout if cached; otherwise queue a background download and fail.
+# Playback must not block on the asset curl timeout.
+cache_asset() {
+  local url="$1"
+  local path
+  path="$(cache_path_for_url "$url")"
 
   if [[ -s "$path" ]]; then
     printf '%s\n' "$path"
     return 0
   fi
 
-  build_curl_auth_headers ""
-  if curl "${CURL_ASSET_OPTS[@]}" "${curl_headers[@]}" -o "$tmp" "$url"; then
-    mv -f "$tmp" "$path"
-    printf '%s\n' "$path"
-    return 0
-  else
-    rm -f "$tmp" >/dev/null 2>&1 || true
-    log "WARN: download failed: $url"
-    return 1
-  fi
+  start_asset_download_bg "$url"
+  return 1
 }
 
 background_fetch_pending() {
@@ -473,6 +548,7 @@ mpv_wait_until_eof_with_timeout() {
   done
 }
 
+# Returns 0 if something was shown, 1 if skipped (not cached yet / invalid).
 play_url() {
   local url src
   url="$(normalize_url "$1")"
@@ -480,12 +556,12 @@ play_url() {
   # assert URL path has an extension (dot after the last '/')
   if [[ "${url%%\?*}" != */*.* ]]; then
     log "WARN: no extension in path, skipping: $url"
-    return 0
+    return 1
   fi
 
   if ! src="$(cache_asset "$url")"; then
-    log "WARN: skip (cache_asset failed): $url"
-    return 0
+    log "WARN: skip (not cached yet): $url"
+    return 1
   fi
 
   wait_while_wizard
@@ -517,6 +593,7 @@ play_url() {
       i=$((i + 1))
     done
   fi
+  return 0
 }
 
 chromium_running() {
@@ -720,7 +797,7 @@ main() {
       continue
     fi
 
-    local n
+    local n played_any=0
     n="$(wc -l < "$MAIN_LIST" | tr -d ' ')"
     log "Playing batch ($n items)"
 
@@ -728,8 +805,33 @@ main() {
       wait_while_wizard
       url="$(normalize_url "$url")"
       [[ -n "$url" ]] || continue
-      play_url "$url"
+      if play_url "$url"; then
+        played_any=1
+      fi
     done < "$MAIN_LIST"
+
+    # Keep looping the current batch while assets are still downloading so the
+    # display stays on playable creatives instead of freezing on a blocking curl.
+    if batch_has_downloads_in_progress; then
+      # Don't wait out curl max-time for Wi-Fi recovery: probe each pass.
+      if ! internet_ping_ok; then
+        note_fetch_reach_failure "ping 8.8.8.8 failed while assets downloading"
+        abort_in_flight_asset_downloads
+      fi
+      if (( ! played_any )); then
+        log "Waiting for cached assets before first play..."
+        sleep 3
+      else
+        log "Downloads still running; looping current batch"
+      fi
+      continue
+    fi
+
+    if (( ! played_any )); then
+      log "No playable assets in batch; waiting before retry..."
+      sleep 5
+      continue
+    fi
 
     swap_pending_if_any
     sync_web_kiosk
