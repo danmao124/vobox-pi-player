@@ -15,8 +15,16 @@ WEB_CONTENT_FILE="${STATE_DIR}/webcontent.txt"
 FAIL_STREAK_FILE="${STATE_DIR}/failstreak.txt"
 RECOVERY_LOCK="${STATE_DIR}/recovery.lock"
 WIZARD_LOCK="${STATE_DIR}/wizard.lock"
+# Coordinated sync from askForEvent (batch + unix play-at)
+SYNC_LIST="${STATE_DIR}/sync.txt"
+SYNC_AT_FILE="${STATE_DIR}/sync_at.txt"
+SYNC_NEXT_FILE="${STATE_DIR}/sync_next.txt"
+SYNC_BLAST_FILE="${STATE_DIR}/sync_blast.txt"
+# Bumped to invalidate in-flight background_fetch_pending writers (no PID kill)
+FETCH_GEN_FILE="${STATE_DIR}/fetchgen.txt"
 
 VIEW_PATH="view/billboard"
+ASK_FOR_EVENT_PATH="device/askforevent"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WIFI_HOTKEY_SCRIPT="${SCRIPT_DIR}/wifi_hotkey.sh"
@@ -83,6 +91,9 @@ if [[ -z "$DEVICE_SECRET" ]]; then
   exit 1
 fi
 
+# Spread askForEvent across seconds 0–29 of each minute (stable per device).
+EVENT_SLOT=$(( 16#${DEVICE_SECRET: -8} % 30 ))
+
 # Build curl auth headers: X-Device-Id, X-Timestamp, X-Signature (HMAC-SHA256(secret, "timestamp.SHA256(body)"))
 # Use only openssl (no xxd) so it works on minimal systems e.g. Raspberry Pi.
 build_curl_auth_headers() {
@@ -129,6 +140,7 @@ ensure_dirs() {
   [[ -f "$INDEX_FILE" ]] || echo "0" > "$INDEX_FILE"
   [[ -f "$MAIN_LIST"  ]] || : > "$MAIN_LIST"
   [[ -f "$PENDING_LIST" ]] || : > "$PENDING_LIST"
+  [[ -f "$FETCH_GEN_FILE" ]] || echo "0" > "$FETCH_GEN_FILE"
   # No recovery/wizard can be in flight at startup; drop locks left by a killed run
   rm -rf "$RECOVERY_LOCK" "$WIZARD_LOCK" >/dev/null 2>&1 || true
   write_fail_streak 0
@@ -412,14 +424,56 @@ cache_asset() {
   return 1
 }
 
+read_fetch_gen() {
+  local g
+  g="$(cat "$FETCH_GEN_FILE" 2>/dev/null || echo 0)"
+  [[ "$g" =~ ^[0-9]+$ ]] || g=0
+  printf '%s' "$g"
+}
+
+# Invalidate in-flight background fetches; returns the new generation.
+bump_fetch_gen() {
+  local g
+  g="$(read_fetch_gen)"
+  g=$((g + 1))
+  echo "$g" > "$FETCH_GEN_FILE"
+  printf '%s' "$g"
+}
+
+# Fetch into gen-scoped temp files; only promote if this gen is still current.
 background_fetch_pending() {
   local idx="$1"
   local bidx="$2"
-  if fetch_batch_to "$idx" "$bidx" "$PENDING_LIST" "$NEXT_FILE" "$NEXT_BLAST_FILE"; then
-    mv "$NEXT_FILE" "$INDEX_FILE"
+  local gen="$3"
+  local out nextf blastf
+
+  out="${STATE_DIR}/pending.${gen}.txt"
+  nextf="${STATE_DIR}/next.${gen}.txt"
+  blastf="${STATE_DIR}/nextblast.${gen}.txt"
+
+  if fetch_batch_to "$idx" "$bidx" "$out" "$nextf" "$blastf"; then
+    if [[ "$(read_fetch_gen)" == "$gen" ]]; then
+      mv -f "$out" "$PENDING_LIST"
+      mv -f "$nextf" "$INDEX_FILE"
+      if [[ -f "$blastf" ]]; then
+        mv -f "$blastf" "$NEXT_BLAST_FILE"
+      fi
+    else
+      log "Discarding stale background fetch (gen=${gen}, current=$(read_fetch_gen))"
+      rm -f "$out" "$nextf" "$blastf" || true
+    fi
   else
-    rm -f "$NEXT_FILE" "$NEXT_BLAST_FILE" || true
+    rm -f "$out" "$nextf" "$blastf" || true
   fi
+}
+
+start_background_fetch_pending() {
+  local idx="$1"
+  local bidx="$2"
+  local gen
+  gen="$(bump_fetch_gen)"
+  background_fetch_pending "$idx" "$bidx" "$gen" &
+  disown || true
 }
 
 read_next_blast_index() {
@@ -427,6 +481,181 @@ read_next_blast_index() {
     blast_idx="$(cat "$NEXT_BLAST_FILE")"
     rm -f "$NEXT_BLAST_FILE"
   fi
+}
+
+# ---------- askForEvent / coordinated sync ----------
+# Parse sync data.timestamp (unix seconds or ISO-8601) -> epoch seconds on stdout.
+parse_sync_timestamp() {
+  local raw="$1"
+  if [[ "$raw" =~ ^[0-9]+$ ]]; then
+    printf '%s' "$raw"
+    return 0
+  fi
+  # GNU date (Pi); fall back to nothing on failure
+  date -d "$raw" +%s 2>/dev/null || true
+}
+
+clear_sync_pending() {
+  rm -f "$SYNC_LIST" "$SYNC_AT_FILE" "$SYNC_NEXT_FILE" "$SYNC_BLAST_FILE" >/dev/null 2>&1 || true
+}
+
+# Fetch batch for a sync command; stage until SYNC_AT.
+arm_sync_command() {
+  local idx="$1"
+  local ts_raw="$2"
+  local at url
+
+  if [[ -z "$idx" ]]; then
+    log "WARN: sync command missing index; ignoring"
+    return 1
+  fi
+  at="$(parse_sync_timestamp "$ts_raw")"
+  if [[ -z "$at" || ! "$at" =~ ^[0-9]+$ ]]; then
+    log "WARN: sync command bad timestamp (${ts_raw:-empty}); ignoring"
+    return 1
+  fi
+
+  log "Sync armed: index=${idx} playAt=${at} (${ts_raw})"
+  if ! fetch_batch_to "$idx" "$blast_idx" "$SYNC_LIST" "$SYNC_NEXT_FILE" "$SYNC_BLAST_FILE"; then
+    log "WARN: sync fetch failed for index=${idx}"
+    clear_sync_pending
+    return 1
+  fi
+  echo "$at" > "$SYNC_AT_FILE"
+
+  # Kick off downloads so assets are warm by playAt
+  while IFS= read -r url; do
+    url="$(normalize_url "$url")"
+    [[ -n "$url" ]] || continue
+    start_asset_download_bg "$url"
+  done < "$SYNC_LIST"
+}
+
+# Apply staged sync to MAIN when the play-at time has been reached (or is past).
+# Returns 0 if MAIN was replaced and the play loop should restart the batch.
+apply_sync_if_due() {
+  local at now
+  [[ -f "$SYNC_AT_FILE" && -s "$SYNC_LIST" ]] || return 1
+  at="$(cat "$SYNC_AT_FILE" 2>/dev/null || true)"
+  [[ "$at" =~ ^[0-9]+$ ]] || { clear_sync_pending; return 1; }
+  now="$(date +%s)"
+  (( now >= at )) || return 1
+
+  log "Applying sync batch (playAt=${at}, lag=$(( now - at ))s)"
+  # Invalidate any in-flight normal/pending fetch before touching playlist/index.
+  bump_fetch_gen >/dev/null
+  mv -f "$SYNC_LIST" "$MAIN_LIST"
+  if [[ -f "$SYNC_NEXT_FILE" ]]; then
+    mv -f "$SYNC_NEXT_FILE" "$INDEX_FILE"
+  fi
+  if [[ -f "$SYNC_BLAST_FILE" ]]; then
+    mv -f "$SYNC_BLAST_FILE" "$NEXT_BLAST_FILE"
+    read_next_blast_index
+  fi
+  : > "$PENDING_LIST" || true
+  rm -f "$SYNC_AT_FILE" >/dev/null 2>&1 || true
+  # Prefetch the following batch after the synced one
+  start_background_fetch_pending "$(cat "$INDEX_FILE" 2>/dev/null || echo "0")" "$blast_idx"
+  return 0
+}
+
+# True when a staged sync should cut into current playback (due or within ~1s).
+sync_should_interrupt_playback() {
+  local at now
+  [[ -f "$SYNC_AT_FILE" && -s "$SYNC_LIST" ]] || return 1
+  at="$(cat "$SYNC_AT_FILE" 2>/dev/null || true)"
+  [[ "$at" =~ ^[0-9]+$ ]] || return 1
+  now="$(date +%s)"
+  (( now >= at - 1 ))
+}
+
+# Busy-wait until play-at (if still in the future), then stop mpv for a clean cutover.
+wait_out_sync_deadline() {
+  local at now
+  at="$(cat "$SYNC_AT_FILE" 2>/dev/null || true)"
+  [[ "$at" =~ ^[0-9]+$ ]] || return 0
+  while true; do
+    now="$(date +%s)"
+    (( now >= at )) && break
+    sleep 0.05
+  done
+  mpv_send '{"command":["stop"]}'
+}
+
+seconds_until_event_slot() {
+  local now_s
+  now_s=$(( $(date +%s) % 60 ))
+  if (( now_s < EVENT_SLOT )); then
+    echo $(( EVENT_SLOT - now_s ))
+  elif (( now_s > EVENT_SLOT )); then
+    echo $(( 60 - now_s + EVENT_SLOT ))
+  else
+    echo 0
+  fi
+}
+
+ask_for_event() {
+  local url body json curl_rc=0
+  url="${API_BASE}/${ASK_FOR_EVENT_PATH}"
+  body="{}"
+
+  build_curl_auth_headers "$body"
+  json="$(curl "${CURL_API_OPTS[@]}" -X POST \
+    -H "Content-Type: application/json" \
+    -d "$body" \
+    "${curl_headers[@]}" \
+    "$url")" || curl_rc=$?
+
+  if (( curl_rc != 0 )); then
+    log "WARN: askForEvent failed (curl rc=$curl_rc)"
+    if internet_ping_ok; then
+      log "Google reachable; treating askForEvent failure as server/API issue"
+    else
+      note_fetch_reach_failure "askForEvent unreachable and ping 8.8.8.8 failed"
+    fi
+    return 1
+  fi
+  note_fetch_reach_ok
+
+  local count
+  count="$(jq -r '(.response.data // []) | length' <<<"$json" 2>/dev/null || echo 0)"
+  log "askForEvent: drained ${count} command(s)"
+
+  # Process sync commands (latest wins if multiple).
+  local idx ts_raw
+  while IFS=$'\t' read -r idx ts_raw; do
+    [[ -n "$idx" ]] || continue
+    arm_sync_command "$idx" "$ts_raw" || true
+  done < <(jq -r '
+    (.response.data // [])[]
+    | select((.type // "") == "sync")
+    | [
+        (.data.index // .data.Index // empty | tostring),
+        (.data.timestamp // .data.Timestamp // empty | tostring)
+      ]
+    | @tsv
+  ' <<<"$json" 2>/dev/null || true)
+
+  # Log other command types for now
+  jq -r '
+    (.response.data // [])[]
+    | select((.type // "") != "sync")
+    | "askForEvent: ignoring type=\(.type // "?")"
+  ' <<<"$json" 2>/dev/null | while IFS= read -r line; do
+    [[ -n "$line" ]] && log "$line"
+  done || true
+}
+
+event_poll_loop() {
+  log "askForEvent schedule: second ${EVENT_SLOT}/60 each minute (machine-id slot)"
+  while true; do
+    local wait_s
+    wait_s="$(seconds_until_event_slot)"
+    (( wait_s > 0 )) && sleep "$wait_s"
+    ask_for_event || true
+    # Leave this second so we don't double-fire before the minute rolls
+    sleep 1
+  done
 }
 
 cleanup_cache() {
@@ -457,7 +686,7 @@ swap_pending_if_any() {
 
   cleanup_cache
   read_next_blast_index
-  background_fetch_pending "$(cat "$INDEX_FILE" 2>/dev/null || echo "0")" "$blast_idx" & disown || true
+  start_background_fetch_pending "$(cat "$INDEX_FILE" 2>/dev/null || echo "0")" "$blast_idx"
 }
 
 # ---------------- mpv IPC ----------------
@@ -537,6 +766,10 @@ mpv_wait_until_eof_with_timeout() {
 
   while true; do
     wizard_active && return 0
+    if sync_should_interrupt_playback; then
+      wait_out_sync_deadline
+      return 2
+    fi
     mpv_get_prop "eof-reached" | grep -q '"data":true' && return 0
     sleep 0.2
     ticks=$((ticks+1))
@@ -548,7 +781,7 @@ mpv_wait_until_eof_with_timeout() {
   done
 }
 
-# Returns 0 if something was shown, 1 if skipped (not cached yet / invalid).
+# Returns 0 if something was shown, 1 if skipped (not cached yet / invalid), 2 if sync cutover.
 play_url() {
   local url src
   url="$(normalize_url "$1")"
@@ -578,17 +811,22 @@ play_url() {
   log "DBG: want_src=$(printf '%q' "$src") mpv_path=$(mpv_get_prop_data path) mpv_filename=$(mpv_get_prop_data filename)"
 
   if is_video "$url"; then
-    local dur
+    local dur wait_rc=0
     dur="$(mpv_get_duration_secs || true)"
     if [[ -n "$dur" && "$dur" -gt 0 ]]; then
-      mpv_wait_until_eof_with_timeout $((dur + 10))
+      mpv_wait_until_eof_with_timeout $((dur + 10)) || wait_rc=$?
     else
-      mpv_wait_until_eof_with_timeout $((5 * 60))
+      mpv_wait_until_eof_with_timeout $((5 * 60)) || wait_rc=$?
     fi
+    (( wait_rc == 2 )) && return 2
   else
     local i=0 ticks=$((IMAGE_SECONDS * 5))
     while (( i < ticks )); do
       wizard_active && return 0
+      if sync_should_interrupt_playback; then
+        wait_out_sync_deadline
+        return 2
+      fi
       sleep 0.2
       i=$((i + 1))
     done
@@ -752,6 +990,11 @@ sync_web_kiosk() {
 main() {
   ensure_dirs
   start_wifi_hotkey
+  clear_sync_pending
+
+  log "Device EVENT_SLOT=${EVENT_SLOT} (askForEvent during second ${EVENT_SLOT} of each minute)"
+  event_poll_loop &
+  disown || true
 
   idx="$(cat "$INDEX_FILE" 2>/dev/null || echo "0")"
   if fetch_batch_to "$idx" "$blast_idx" "$PENDING_LIST" "$NEXT_FILE" "$NEXT_BLAST_FILE"; then
@@ -775,12 +1018,21 @@ main() {
 
   sync_web_kiosk
 
-  background_fetch_pending "$(cat "$INDEX_FILE" 2>/dev/null || echo "0")" "$blast_idx" & disown || true
+  start_background_fetch_pending "$(cat "$INDEX_FILE" 2>/dev/null || echo "0")" "$blast_idx"
 
   start_mpv_if_needed
 
   while true; do
     wait_while_wizard
+
+    # If a sync deadline is near/past, wait it out and cut over before more ads.
+    if sync_should_interrupt_playback; then
+      wait_out_sync_deadline
+    fi
+    if apply_sync_if_due; then
+      sync_web_kiosk
+      continue
+    fi
 
     if [[ ! -s "$MAIN_LIST" ]]; then
       log "WARN: main list empty; refetching..."
@@ -791,24 +1043,51 @@ main() {
         read_next_blast_index
       else
         log "No images available; waiting 60s before retry..."
-        sleep 60
+        local waited=0
+        while (( waited < 60 )); do
+          if sync_should_interrupt_playback; then
+            break
+          fi
+          sleep 1
+          waited=$((waited + 1))
+        done
       fi
       sync_web_kiosk
       continue
     fi
 
-    local n played_any=0
+    local n played_any=0 play_rc=0
     n="$(wc -l < "$MAIN_LIST" | tr -d ' ')"
     log "Playing batch ($n items)"
 
     while IFS= read -r url; do
       wait_while_wizard
+      if sync_should_interrupt_playback; then
+        wait_out_sync_deadline
+        break
+      fi
+      if apply_sync_if_due; then
+        played_any=0
+        break
+      fi
       url="$(normalize_url "$url")"
       [[ -n "$url" ]] || continue
-      if play_url "$url"; then
+      play_rc=0
+      play_url "$url" || play_rc=$?
+      if (( play_rc == 2 )); then
+        # Sync interrupt during asset; apply and restart batch
+        apply_sync_if_due || true
+        played_any=0
+        break
+      elif (( play_rc == 0 )); then
         played_any=1
       fi
     done < "$MAIN_LIST"
+
+    if apply_sync_if_due; then
+      sync_web_kiosk
+      continue
+    fi
 
     # Keep looping the current batch while assets are still downloading so the
     # display stays on playable creatives instead of freezing on a blocking curl.
