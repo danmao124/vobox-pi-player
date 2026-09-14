@@ -569,7 +569,8 @@ sync_should_interrupt_playback() {
   (( now >= at - 1 ))
 }
 
-# Busy-wait until play-at (if still in the future), then stop mpv for a clean cutover.
+# Busy-wait until play-at (if still in the future). Do not stop mpv — next
+# loadfile replace keeps the last frame, same as a normal batch swap.
 wait_out_sync_deadline() {
   local at now
   at="$(cat "$SYNC_AT_FILE" 2>/dev/null || true)"
@@ -579,7 +580,6 @@ wait_out_sync_deadline() {
     (( now >= at )) && break
     sleep 0.05
   done
-  mpv_send '{"command":["stop"]}'
 }
 
 seconds_until_event_slot() {
