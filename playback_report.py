@@ -5,7 +5,6 @@ import json
 import math
 import os
 import socket
-import subprocess
 import sys
 import time
 from pathlib import Path
@@ -107,18 +106,10 @@ def wait_image(started_ns, duration, wizard_lock, sync_at, sync_list):
 
 def snapshot(path):
     sampled = now_ms()
-    try:
-        result = subprocess.run(
-            ["timedatectl", "show", "-p", "NTPSynchronized", "--value"],
-            capture_output=True, text=True, timeout=2, check=False)
-        synced = result.returncode == 0 and result.stdout.strip() == "yes"
-    except (OSError, subprocess.TimeoutExpired):
-        synced = False
     history = read_history(path)
     segments = [dict(x, endMs=min(x.get("endMs", sampled), sampled))
                 for x in history if x.get("endMs", sampled) >= sampled - WINDOW_MS]
-    return {"playback": {"sampledAtMs": sampled, "clockSynced": synced,
-                         "segments": segments[-256:]}}
+    return {"playback": {"sampledAtMs": sampled, "segments": segments[-256:]}}
 
 
 if __name__ == "__main__":

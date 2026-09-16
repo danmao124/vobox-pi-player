@@ -35,10 +35,10 @@ class PlaybackReportTests(unittest.TestCase):
             self.assertTrue(recorded[0]["key"].endswith(":1"))
             self.assertEqual(recorded[0]["nextIndex"], 20)
             self.assertEqual(recorded[0]["nextBlastIndex"], 4)
-            with patch.object(report, "now_ms", return_value=110_000), patch.object(report.subprocess, "run", return_value=MagicMock(returncode=0, stdout="yes\n")):
+            with patch.object(report, "now_ms", return_value=110_000):
                 snapshot = report.snapshot(history)["playback"]
                 self.assertEqual(snapshot["segments"][0]["endMs"], 110_000)
-                self.assertTrue(snapshot["clockSynced"])
+                self.assertNotIn("clockSynced", snapshot)
                 self.assertNotIn("endMs", report.read_history(history)[0])
                 report.finish(history)
                 self.assertEqual(report.read_history(history)[0]["endMs"], 110_000)
@@ -65,15 +65,14 @@ class PlaybackReportTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 report.load_and_record("socket", "bad", "unused", 1, "unused")
 
-    def test_history_is_bounded_and_missing_clock_is_not_trusted(self):
+    def test_history_and_snapshot_are_bounded(self):
         with tempfile.TemporaryDirectory() as d:
             path = Path(d) / "history.json"
             with patch.object(report, "now_ms", return_value=1_000_000):
                 report.save_history(path, [{"key": "old", "startMs": 1, "endMs": 2}] +
                     [{"key": "recent", "startMs": 999_000, "endMs": 999_500}] * 300)
                 self.assertEqual(len(report.read_history(path)), 256)
-                with patch.object(report.subprocess, "run", side_effect=OSError):
-                    self.assertFalse(report.snapshot(path)["playback"]["clockSynced"])
+                self.assertEqual(len(report.snapshot(path)["playback"]["segments"]), 256)
 
 class ImageDeadlineTests(unittest.TestCase):
     def test_elapsed_setup_and_polling_overhead_do_not_extend_duration(self):
