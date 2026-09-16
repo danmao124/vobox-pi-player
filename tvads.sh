@@ -22,6 +22,8 @@ SYNC_NEXT_FILE="${STATE_DIR}/sync_next.txt"
 SYNC_BLAST_FILE="${STATE_DIR}/sync_blast.txt"
 # Bumped to invalidate in-flight background_fetch_pending writers (no PID kill)
 FETCH_GEN_FILE="${STATE_DIR}/fetchgen.txt"
+PLAYBACK_HISTORY="${STATE_DIR}/playback-history.json"
+LAST_SYNC_COMMAND=""
 
 VIEW_PATH="view/billboard"
 ASK_FOR_EVENT_PATH="device/askforevent"
@@ -316,6 +318,12 @@ fetch_batch_to() {
   printf "%s\n" "$urls" > "$out"
   [[ -n "$next" ]] && echo "$next" > "$nextfile" || echo "$idx" > "$nextfile"
   [[ -n "$next_blast" ]] && echo "$next_blast" > "$nextblastfile" || echo "$blast_idx" > "$nextblastfile"
+  # Keep the next cursor with this exact playlist, independent of prefetch advancement.
+  local playlist_hash
+  playlist_hash="$(openssl dgst -sha256 -r "$out" | awk '{print $1}')"
+  jq -nc --arg hash "$playlist_hash" --arg next "$(cat "$nextfile")" \
+    --arg blast "$(cat "$nextblastfile")" \
+    '{playlistHash:$hash,nextIndex:($next|tonumber),nextBlastIndex:($blast|tonumber)}' > "${out}.cursor"
   log "OK: $(wc -l < "$out" | tr -d ' ') assets, nextIndex=$(cat "$nextfile") nextBlastIndex=$(cat "$nextblastfile")"
 }
 
@@ -453,6 +461,7 @@ background_fetch_pending() {
 
   if fetch_batch_to "$idx" "$bidx" "$out" "$nextf" "$blastf"; then
     if [[ "$(read_fetch_gen)" == "$gen" ]]; then
+      mv -f "${out}.cursor" "${PENDING_LIST}.cursor"
       mv -f "$out" "$PENDING_LIST"
       mv -f "$nextf" "$INDEX_FILE"
       if [[ -f "$blastf" ]]; then
@@ -460,10 +469,10 @@ background_fetch_pending() {
       fi
     else
       log "Discarding stale background fetch (gen=${gen}, current=$(read_fetch_gen))"
-      rm -f "$out" "$nextf" "$blastf" || true
+      rm -f "$out" "${out}.cursor" "$nextf" "$blastf" || true
     fi
   else
-    rm -f "$out" "$nextf" "$blastf" || true
+    rm -f "$out" "${out}.cursor" "$nextf" "$blastf" || true
   fi
 }
 
@@ -496,13 +505,14 @@ parse_sync_timestamp() {
 }
 
 clear_sync_pending() {
-  rm -f "$SYNC_LIST" "$SYNC_AT_FILE" "$SYNC_NEXT_FILE" "$SYNC_BLAST_FILE" >/dev/null 2>&1 || true
+  rm -f "$SYNC_LIST" "${SYNC_LIST}.cursor" "$SYNC_AT_FILE" "$SYNC_NEXT_FILE" "$SYNC_BLAST_FILE" >/dev/null 2>&1 || true
 }
 
 # Fetch batch for a sync command; stage until SYNC_AT.
 arm_sync_command() {
   local idx="$1"
   local ts_raw="$2"
+  local sync_blast_idx="${3:-$blast_idx}"
   local at url
 
   if [[ -z "$idx" ]]; then
@@ -516,7 +526,7 @@ arm_sync_command() {
   fi
 
   log "Sync armed: index=${idx} playAt=${at} (${ts_raw})"
-  if ! fetch_batch_to "$idx" "$blast_idx" "$SYNC_LIST" "$SYNC_NEXT_FILE" "$SYNC_BLAST_FILE"; then
+  if ! fetch_batch_to "$idx" "$sync_blast_idx" "$SYNC_LIST" "$SYNC_NEXT_FILE" "$SYNC_BLAST_FILE"; then
     log "WARN: sync fetch failed for index=${idx}"
     clear_sync_pending
     return 1
@@ -541,10 +551,22 @@ apply_sync_if_due() {
   now="$(date +%s)"
   (( now >= at )) || return 1
 
+  # A slow device keeps its current batch and can retry on the next watchdog sync.
+  local url
+  while IFS= read -r url; do
+    url="$(normalize_url "$url")"
+    [[ -n "$url" ]] || continue
+    if [[ ! -s "$(cache_path_for_url "$url")" ]]; then
+      log "Sync missed: assets not ready; keeping current batch"
+      clear_sync_pending
+      return 1
+    fi
+  done < "$SYNC_LIST"
+
   log "Applying sync batch (playAt=${at}, lag=$(( now - at ))s)"
   # Invalidate any in-flight normal/pending fetch before touching playlist/index.
   bump_fetch_gen >/dev/null
-  mv -f "$SYNC_LIST" "$MAIN_LIST"
+  promote_main_list "$SYNC_LIST"
   if [[ -f "$SYNC_NEXT_FILE" ]]; then
     mv -f "$SYNC_NEXT_FILE" "$INDEX_FILE"
   fi
@@ -597,7 +619,7 @@ seconds_until_event_slot() {
 ask_for_event() {
   local url body json curl_rc=0
   url="${API_BASE}/${ASK_FOR_EVENT_PATH}"
-  body="{}"
+  body="$(python3 "$SCRIPT_DIR/playback_report.py" snapshot "$PLAYBACK_HISTORY" 2>/dev/null || echo "{}")"
 
   build_curl_auth_headers "$body"
   json="$(curl "${CURL_API_OPTS[@]}" -X POST \
@@ -622,16 +644,20 @@ ask_for_event() {
   log "askForEvent: drained ${count} command(s)"
 
   # Process sync commands (latest wins if multiple).
-  local idx ts_raw
-  while IFS=$'\t' read -r idx ts_raw; do
+  local idx ts_raw sync_blast_idx
+  while IFS=$'\t' read -r idx ts_raw sync_blast_idx; do
     [[ -n "$idx" ]] || continue
-    arm_sync_command "$idx" "$ts_raw" || true
+    [[ "$LAST_SYNC_COMMAND" == "$idx|$ts_raw|$sync_blast_idx" ]] && continue
+    if arm_sync_command "$idx" "$ts_raw" "$sync_blast_idx"; then
+      LAST_SYNC_COMMAND="$idx|$ts_raw|$sync_blast_idx"
+    fi
   done < <(jq -r '
     (.response.data // [])[]
     | select((.type // "") == "sync")
     | [
         (.data.index // .data.Index // empty | tostring),
-        (.data.timestamp // .data.Timestamp // empty | tostring)
+        (.data.timestamp // .data.Timestamp // empty | tostring),
+        (.data.blastIndex // "" | tostring)
       ]
     | @tsv
   ' <<<"$json" 2>/dev/null || true)
@@ -677,10 +703,21 @@ cleanup_cache() {
       done
 }
 
+# Only the main playback process promotes lists. Hash validation rejects mismatched metadata.
+promote_main_list() {
+  local source="$1"
+  if [[ -f "${source}.cursor" ]]; then
+    mv -f "${source}.cursor" "${MAIN_LIST}.cursor"
+  else
+    rm -f "${MAIN_LIST}.cursor"
+  fi
+  mv -f "$source" "$MAIN_LIST"
+}
+
 swap_pending_if_any() {
   if [[ -s "$PENDING_LIST" ]]; then
     log "Swap: pending -> main"
-    mv "$PENDING_LIST" "$MAIN_LIST"
+    promote_main_list "$PENDING_LIST"
     : > "$PENDING_LIST" || true
   fi
 
@@ -807,7 +844,10 @@ play_url() {
     mpv_send '{"command":["set_property","loop-file","inf"]}'
   fi
 
-  mpv_send "{\"command\":[\"loadfile\",\"$src\",\"replace\"]}"
+  if ! python3 "$SCRIPT_DIR/playback_report.py" load "$MPV_SOCK" "$src" "$MAIN_LIST" "$item_position" "$PLAYBACK_HISTORY"; then
+    log "WARN: playback reporting unavailable; loading without telemetry: $url"
+    mpv_send "$(jq -nc --arg src "$src" '{command:["loadfile",$src,"replace"]}')"
+  fi
   log "DBG: want_src=$(printf '%q' "$src") mpv_path=$(mpv_get_prop_data path) mpv_filename=$(mpv_get_prop_data filename)"
 
   if is_video "$url"; then
@@ -991,6 +1031,7 @@ main() {
   ensure_dirs
   start_wifi_hotkey
   clear_sync_pending
+  rm -f "$PLAYBACK_HISTORY"
 
   log "Device EVENT_SLOT=${EVENT_SLOT} (askForEvent during second ${EVENT_SLOT} of each minute)"
   event_poll_loop &
@@ -998,7 +1039,7 @@ main() {
 
   idx="$(cat "$INDEX_FILE" 2>/dev/null || echo "0")"
   if fetch_batch_to "$idx" "$blast_idx" "$PENDING_LIST" "$NEXT_FILE" "$NEXT_BLAST_FILE"; then
-    mv "$PENDING_LIST" "$MAIN_LIST"
+    promote_main_list "$PENDING_LIST"
     mv "$NEXT_FILE" "$INDEX_FILE"
     read_next_blast_index
   else
@@ -1010,7 +1051,7 @@ main() {
         sleep 5
         idx="$(cat "$INDEX_FILE" 2>/dev/null || echo "0")"
       done
-      mv "$PENDING_LIST" "$MAIN_LIST"
+      promote_main_list "$PENDING_LIST"
       mv "$NEXT_FILE" "$INDEX_FILE"
       read_next_blast_index
     fi
@@ -1038,7 +1079,7 @@ main() {
       log "WARN: main list empty; refetching..."
       idx="$(cat "$INDEX_FILE" 2>/dev/null || echo "0")"
       if fetch_batch_to "$idx" "$blast_idx" "$PENDING_LIST" "$NEXT_FILE" "$NEXT_BLAST_FILE"; then
-        mv "$PENDING_LIST" "$MAIN_LIST"
+        promote_main_list "$PENDING_LIST"
         mv "$NEXT_FILE" "$INDEX_FILE"
         read_next_blast_index
       else
@@ -1056,7 +1097,7 @@ main() {
       continue
     fi
 
-    local n played_any=0 play_rc=0
+    local n played_any=0 play_rc=0 item_position=0
     n="$(wc -l < "$MAIN_LIST" | tr -d ' ')"
     log "Playing batch ($n items)"
 
@@ -1072,8 +1113,10 @@ main() {
       fi
       url="$(normalize_url "$url")"
       [[ -n "$url" ]] || continue
+      item_position=$((item_position + 1))
       play_rc=0
       play_url "$url" || play_rc=$?
+      python3 "$SCRIPT_DIR/playback_report.py" finish "$PLAYBACK_HISTORY" || true
       if (( play_rc == 2 )); then
         # Sync interrupt during asset; apply and restart batch
         apply_sync_if_due || true
