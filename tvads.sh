@@ -820,7 +820,7 @@ mpv_wait_until_eof_with_timeout() {
 
 # Returns 0 if something was shown, 1 if skipped (not cached yet / invalid), 2 if sync cutover.
 play_url() {
-  local url src
+  local url src playback_start
   url="$(normalize_url "$1")"
 
   # assert URL path has an extension (dot after the last '/')
@@ -844,7 +844,8 @@ play_url() {
     mpv_send '{"command":["set_property","loop-file","inf"]}'
   fi
 
-  if ! python3 "$SCRIPT_DIR/playback_report.py" load "$MPV_SOCK" "$src" "$MAIN_LIST" "$item_position" "$PLAYBACK_HISTORY"; then
+  if ! playback_start="$(python3 "$SCRIPT_DIR/playback_report.py" load "$MPV_SOCK" "$src" "$MAIN_LIST" "$item_position" "$PLAYBACK_HISTORY")"; then
+    playback_start=""
     log "WARN: playback reporting unavailable; loading without telemetry: $url"
     mpv_send "$(jq -nc --arg src "$src" '{command:["loadfile",$src,"replace"]}')"
   fi
@@ -860,6 +861,18 @@ play_url() {
     fi
     (( wait_rc == 2 )) && return 2
   else
+    local image_wait_rc=0
+    python3 "$SCRIPT_DIR/playback_report.py" wait-image "$playback_start" "$IMAGE_SECONDS" \
+      "$WIZARD_LOCK" "$SYNC_AT_FILE" "$SYNC_LIST" || image_wait_rc=$?
+    if (( image_wait_rc == 2 )); then
+      wait_out_sync_deadline
+      return 2
+    elif (( image_wait_rc == 0 )); then
+      return 0
+    fi
+
+    # Keep playback functional if the helper is missing during an update or fails.
+    log "WARN: image deadline timer unavailable; using fallback timer"
     local i=0 ticks=$((IMAGE_SECONDS * 5))
     while (( i < ticks )); do
       wizard_active && return 0

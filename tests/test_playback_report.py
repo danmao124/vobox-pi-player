@@ -25,8 +25,11 @@ class PlaybackReportTests(unittest.TestCase):
             sock.makefile.return_value = io.StringIO(
                 '{"error":"success"}\n{"event":"playback-restart"}\n'
                 '{"event":"file-loaded"}\n{"event":"playback-restart"}\n')
-            with patch.object(report.socket, "socket", return_value=sock), patch.object(report, "now_ms", return_value=100_000):
-                report.load_and_record("socket", "asset.png", playlist, "1", history)
+            with patch.object(report.socket, "socket", return_value=sock), \
+                    patch.object(report, "now_ms", return_value=100_000), \
+                    patch.object(report.time, "monotonic_ns", return_value=123_456_789):
+                started = report.load_and_record("socket", "asset.png", playlist, "1", history)
+            self.assertEqual(started, 123_456_789)
             recorded = report.read_history(history)
             self.assertEqual(recorded[0]["startMs"], 100_000)
             self.assertTrue(recorded[0]["key"].endswith(":1"))
@@ -72,7 +75,95 @@ class PlaybackReportTests(unittest.TestCase):
                 with patch.object(report.subprocess, "run", side_effect=OSError):
                     self.assertFalse(report.snapshot(path)["playback"]["clockSynced"])
 
+class ImageDeadlineTests(unittest.TestCase):
+    def test_elapsed_setup_and_polling_overhead_do_not_extend_duration(self):
+        with tempfile.TemporaryDirectory() as d:
+            # Playback started at 100s; setup has already consumed one second.
+            clock = [101_000_000_000]
+            sleeps = []
+
+            def monotonic_ns():
+                clock[0] += 15_000_000  # Simulate work between sleeps.
+                return clock[0]
+
+            def sleep(seconds):
+                sleeps.append(seconds)
+                clock[0] += round(seconds * 1_000_000_000) + 20_000_000
+
+            with patch.object(report.time, "monotonic_ns", side_effect=monotonic_ns), \
+                    patch.object(report.time, "sleep", side_effect=sleep), \
+                    patch.object(report.time, "time_ns", side_effect=AssertionError("wall clock used for duration")):
+                rc = report.wait_image("100000000000", "15", d + "/wizard", d + "/at", d + "/list")
+            self.assertEqual(rc, 0)
+            self.assertGreaterEqual(clock[0], 115_000_000_000)
+            self.assertLessEqual(clock[0], 115_035_000_000)
+            self.assertTrue(all(0 < seconds <= 0.2 for seconds in sleeps))
+            self.assertLess(sleeps[-1], 0.2)
+
+    def test_expired_deadline_does_not_start_another_full_wait(self):
+        with tempfile.TemporaryDirectory() as d, \
+                patch.object(report.time, "monotonic_ns", return_value=120_000_000_000), \
+                patch.object(report.time, "sleep") as sleep:
+            self.assertEqual(report.wait_image("100000000000", "15", d + "/wizard", d + "/at", d + "/list"), 0)
+            sleep.assert_not_called()
+
+    def test_sync_cutover_requires_valid_timestamp_and_nonempty_playlist(self):
+        cases = [("501", "asset.png", 2), ("499", "asset.png", 2),
+                 ("501", "", 0), ("999", "asset.png", 0), ("bad", "asset.png", 0)]
+        for at, playlist, expected in cases:
+            with self.subTest(at=at, playlist=playlist), tempfile.TemporaryDirectory() as d:
+                Path(d, "at").write_text(at)
+                Path(d, "list").write_text(playlist)
+                with patch.object(report.time, "time_ns", return_value=500_000_000_000), \
+                        patch.object(report.time, "monotonic_ns", return_value=120_000_000_000), \
+                        patch.object(report.time, "sleep") as sleep:
+                    rc = report.wait_image("100000000000", "15", d + "/wizard", d + "/at", d + "/list")
+                self.assertEqual(rc, expected)
+                sleep.assert_not_called()
+
+    def test_wifi_wizard_interrupts_a_running_image_wait(self):
+        with tempfile.TemporaryDirectory() as d:
+            def sleep(seconds):
+                Path(d, "wizard").mkdir()
+
+            with patch.object(report.time, "monotonic_ns", return_value=100_000_000_000), \
+                    patch.object(report.time, "sleep", side_effect=sleep) as sleeper:
+                rc = report.wait_image("100000000000", "15", d + "/wizard", d + "/at", d + "/list")
+            self.assertEqual(rc, 0)
+            sleeper.assert_called_once()
+
+
 class ShellSyncTests(unittest.TestCase):
+    def test_image_sync_interrupt_waits_for_scheduled_cutover(self):
+        source = (Path(__file__).resolve().parents[1] / "tvads.sh").read_text()
+        function = "play_url() {" + source.split("play_url() {", 1)[1].split("\n}\n", 1)[0] + "\n}\n"
+        script = function + r"""
+normalize_url() { echo "$1"; }
+cache_asset() { echo asset.png; }
+wait_while_wizard() { :; }
+start_mpv_if_needed() { :; }
+is_video() { return 1; }
+mpv_send() { :; }
+mpv_get_prop_data() { :; }
+log() { :; }
+python3() {
+  case "$2" in
+    load) echo 123456789 ;;
+    wait-image)
+      [[ "$3" == 123456789 && "$4" == 15 ]] || exit 99
+      return 2 ;;
+  esac
+}
+wait_out_sync_deadline() { echo waited-for-sync; }
+SCRIPT_DIR=unused MPV_SOCK=unused MAIN_LIST=unused item_position=1 PLAYBACK_HISTORY=unused
+IMAGE_SECONDS=15 WIZARD_LOCK=unused SYNC_AT_FILE=unused SYNC_LIST=unused
+rc=0
+play_url https://example.com/image.png || rc=$?
+echo "result=$rc"
+"""
+        result = subprocess.run(["bash", "-eu", "-c", script], capture_output=True, text=True, check=True)
+        self.assertEqual(result.stdout, "waited-for-sync\nresult=2\n")
+
     def test_sync_requires_cached_assets_and_promotes_ready_batch(self):
         source = (Path(__file__).resolve().parents[1] / "tvads.sh").read_text()
         def function(name):

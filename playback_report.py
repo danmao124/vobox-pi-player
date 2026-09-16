@@ -2,6 +2,7 @@
 """Record mpv playback events and supply bounded history for signed heartbeats."""
 import hashlib
 import json
+import math
 import os
 import socket
 import subprocess
@@ -69,14 +70,39 @@ def load_and_record(sock_path, src, playlist, position, history_path):
                 if event.get("event") == "file-loaded":
                     loaded = True
                 if loaded and event.get("event") == "playback-restart":
+                    started_ns = time.monotonic_ns()
                     start = now_ms()
                     batch = hashlib.sha256(Path(playlist).read_bytes()).hexdigest()
                     history = read_history(history_path)
                     history.append({"key": f"{batch}:{int(position)}", "startMs": start,
                                     **next_cursor(playlist, batch)})
                     save_history(history_path, history)
-                    return
+                    return started_ns
     raise RuntimeError("mpv did not confirm playback within 5 seconds")
+
+
+def wait_image(started_ns, duration, wizard_lock, sync_at, sync_list):
+    """Wait to a fixed image deadline; return 2 for the shell's sync cutover."""
+    seconds = float(duration)
+    if not math.isfinite(seconds) or seconds < 0:
+        raise ValueError("Image duration must be finite and non-negative")
+    # An unconfirmed/fallback load has no timestamp; start its timer here.
+    start = int(started_ns) if started_ns else time.monotonic_ns()
+    deadline = start + int(seconds * 1_000_000_000)
+    while True:
+        if Path(wizard_lock).is_dir():
+            return 0
+        try:
+            at = Path(sync_at).read_text().strip()
+            if at.isascii() and at.isdecimal() and Path(sync_list).stat().st_size > 0:
+                if time.time_ns() // 1_000_000_000 >= int(at) - 1:
+                    return 2
+        except OSError:
+            pass  # No complete staged sync yet; files can change between reads.
+        remaining = (deadline - time.monotonic_ns()) / 1_000_000_000
+        if remaining <= 0:
+            return 0
+        time.sleep(min(0.2, remaining))
 
 
 def snapshot(path):
@@ -99,7 +125,9 @@ if __name__ == "__main__":
     try:
         action, *args = sys.argv[1:]
         if action == "load":
-            load_and_record(*args)
+            print(load_and_record(*args))
+        elif action == "wait-image":
+            sys.exit(wait_image(*args))
         elif action == "finish":
             finish(*args)
         elif action == "snapshot":
