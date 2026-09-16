@@ -1,6 +1,10 @@
 #!/usr/bin/env bash 
 set -euo pipefail
 
+# Bump for each player release, including changes to playback_report.py.
+# Captured by the running process; updating files takes effect after restart.
+readonly PLAYER_VERSION="2026.09.16.1"
+
 CONFIG="/data/player/config.env"
 STATE_DIR="/tmp/player/state"
 ASSET_DIR="/data/assets"
@@ -616,10 +620,16 @@ seconds_until_event_slot() {
   fi
 }
 
+build_event_body() {
+  local playback_body
+  playback_body="$(python3 "$SCRIPT_DIR/playback_report.py" snapshot "$PLAYBACK_HISTORY" 2>/dev/null || echo "{}")"
+  jq -c --arg version "$PLAYER_VERSION" '. + {playerVersion: $version}' <<<"$playback_body"
+}
+
 ask_for_event() {
   local url body json curl_rc=0
   url="${API_BASE}/${ASK_FOR_EVENT_PATH}"
-  body="$(python3 "$SCRIPT_DIR/playback_report.py" snapshot "$PLAYBACK_HISTORY" 2>/dev/null || echo "{}")"
+  body="$(build_event_body)"
 
   build_curl_auth_headers "$body"
   json="$(curl "${CURL_API_OPTS[@]}" -X POST \
@@ -1046,6 +1056,7 @@ main() {
   clear_sync_pending
   rm -f "$PLAYBACK_HISTORY"
 
+  log "Player version=${PLAYER_VERSION}"
   log "Device EVENT_SLOT=${EVENT_SLOT} (askForEvent during second ${EVENT_SLOT} of each minute)"
   event_poll_loop &
   disown || true
