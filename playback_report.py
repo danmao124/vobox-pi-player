@@ -9,7 +9,7 @@ import sys
 import time
 from pathlib import Path
 
-WINDOW_MS = 180_000
+WINDOW_MS = 120_000
 
 
 def now_ms():

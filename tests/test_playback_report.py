@@ -74,6 +74,22 @@ class PlaybackReportTests(unittest.TestCase):
                 self.assertEqual(len(report.read_history(path)), 256)
                 self.assertEqual(len(report.snapshot(path)["playback"]["segments"]), 256)
 
+    def test_two_minute_history_retains_boundary_and_active_segments(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "history.json"
+            history = [
+                {"key": "expired", "startMs": 800_000, "endMs": 879_999},
+                {"key": "boundary", "startMs": 879_999, "endMs": 880_000},
+                {"key": "active", "startMs": 880_000},
+            ]
+            path.write_text(json.dumps(history))
+            with patch.object(report, "now_ms", return_value=1_000_000):
+                snapshot = report.snapshot(path)["playback"]["segments"]
+                self.assertEqual([s["key"] for s in snapshot], ["boundary", "active"])
+                self.assertEqual(snapshot[-1]["endMs"], 1_000_000)
+                report.save_history(path, history)
+                self.assertEqual(report.read_history(path), history[1:])
+
 class ImageDeadlineTests(unittest.TestCase):
     def test_elapsed_setup_and_polling_overhead_do_not_extend_duration(self):
         with tempfile.TemporaryDirectory() as d:

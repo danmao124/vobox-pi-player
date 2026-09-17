@@ -3,7 +3,7 @@ set -euo pipefail
 
 # Bump for each player release, including changes to playback_report.py.
 # Captured by the running process; updating files takes effect after restart.
-readonly PLAYER_VERSION="2026.09.16.1"
+readonly PLAYER_VERSION="2026.09.16.2"
 
 CONFIG="/data/player/config.env"
 STATE_DIR="/tmp/player/state"
