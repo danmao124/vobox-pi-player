@@ -651,7 +651,7 @@ ask_for_event() {
 
   local count
   count="$(jq -r '(.response.data // []) | length' <<<"$json" 2>/dev/null || echo 0)"
-  log "askForEvent: drained ${count} command(s)"
+  log "askForEvent: received ${count} command(s)"
 
   # Process sync commands (latest wins if multiple).
   local idx ts_raw sync_blast_idx
