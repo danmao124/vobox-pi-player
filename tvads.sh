@@ -3,7 +3,7 @@ set -euo pipefail
 
 # Bump for each player release, including changes to playback_report.py.
 # Captured by the running process; updating files takes effect after restart.
-readonly PLAYER_VERSION="2026.09.16.2"
+readonly PLAYER_VERSION="2026.09.21.1"
 
 CONFIG="/data/player/config.env"
 STATE_DIR="/tmp/player/state"
@@ -82,7 +82,7 @@ source "$CONFIG"
 : "${ID:?Missing ID in config.env}"
 
 IMAGE_SECONDS="${IMAGE_SECONDS:-15}"
-MAX_CACHE_MB="${MAX_CACHE_MB:-30000}" # 30GB
+MAX_CACHE_MB="${MAX_CACHE_MB:-30000}" # Trim above this limit to 90%; keep active assets.
 ORIENTATION="${ORIENTATION:-0}"  # Screen orientation: 0, 90, 180, or 270
 WEB_STATION="${WEB_STATION:-}"  # Optional web station id
 
@@ -273,6 +273,20 @@ note_fetch_reach_ok() {
   write_fail_streak 0
 }
 
+# Serialize playlist publication with cache deletion. Fetches/downloads stay outside
+# the lock; sync downloads check the cache only after their playlist is published.
+with_cache_lock() {
+  python3 - "${STATE_DIR}/cache-cleanup.lock" "$@" <<'PY'
+import fcntl
+import subprocess
+import sys
+
+with open(sys.argv[1], "a") as lock:
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    sys.exit(subprocess.call(sys.argv[2:]))
+PY
+}
+
 fetch_batch_to() {
   local idx="$1"
   local blast_idx="$2"
@@ -319,15 +333,21 @@ fetch_batch_to() {
     return 1
   fi
 
-  printf "%s\n" "$urls" > "$out"
+  # Publish the complete list under the cleanup lock, including sync fetches.
+  local list_tmp="${out}.tmp"
+  printf "%s\n" "$urls" > "$list_tmp"
   [[ -n "$next" ]] && echo "$next" > "$nextfile" || echo "$idx" > "$nextfile"
   [[ -n "$next_blast" ]] && echo "$next_blast" > "$nextblastfile" || echo "$blast_idx" > "$nextblastfile"
   # Keep the next cursor with this exact playlist, independent of prefetch advancement.
   local playlist_hash
-  playlist_hash="$(openssl dgst -sha256 -r "$out" | awk '{print $1}')"
+  playlist_hash="$(openssl dgst -sha256 -r "$list_tmp" | awk '{print $1}')"
   jq -nc --arg hash "$playlist_hash" --arg next "$(cat "$nextfile")" \
     --arg blast "$(cat "$nextblastfile")" \
     '{playlistHash:$hash,nextIndex:($next|tonumber),nextBlastIndex:($blast|tonumber)}' > "${out}.cursor"
+  if ! with_cache_lock mv -f "$list_tmp" "$out"; then
+    rm -f "$list_tmp"
+    return 1
+  fi
   log "OK: $(wc -l < "$out" | tr -d ' ') assets, nextIndex=$(cat "$nextfile") nextBlastIndex=$(cat "$nextblastfile")"
 }
 
@@ -466,7 +486,7 @@ background_fetch_pending() {
   if fetch_batch_to "$idx" "$bidx" "$out" "$nextf" "$blastf"; then
     if [[ "$(read_fetch_gen)" == "$gen" ]]; then
       mv -f "${out}.cursor" "${PENDING_LIST}.cursor"
-      mv -f "$out" "$PENDING_LIST"
+      with_cache_lock mv -f "$out" "$PENDING_LIST" || return 1
       mv -f "$nextf" "$INDEX_FILE"
       if [[ -f "$blastf" ]]; then
         mv -f "$blastf" "$NEXT_BLAST_FILE"
@@ -695,22 +715,109 @@ event_poll_loop() {
 }
 
 cleanup_cache() {
-  local used_mb
-  used_mb=$(du -sm "$ASSET_DIR" | awk '{print $1}')
+  # Keep this helper in the script so an update does not need another runtime file.
+  if ! python3 - "$ASSET_DIR" "$MAX_CACHE_MB" "${STATE_DIR}/cache-cleanup.lock" "$MAIN_LIST" "$PENDING_LIST" "$SYNC_LIST" <<'PY'
+import fcntl
+import os
+from pathlib import Path
+import stat
+import subprocess
+import sys
+import time
 
-  if (( used_mb <= MAX_CACHE_MB )); then
-    return
+
+def log(message):
+    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Cache cleanup: {message}")
+
+
+def cleanup():
+    assets = Path(sys.argv[1])
+    limit_mb = int(sys.argv[2])
+    if limit_mb <= 0:
+        raise ValueError("MAX_CACHE_MB must be positive")
+    playlists = [Path(path) for path in sys.argv[4:]]
+    target_mb = limit_mb * 90 // 100
+    target_bytes = target_mb * 1024 * 1024
+
+    def usage_bytes():
+        # du counts allocated space, including partial downloads and metadata.
+        return int(subprocess.check_output(["du", "-sk", str(assets)]).split()[0]) * 1024
+
+    def protected_names():
+        names = {path.name for path in playlists}
+        for index, playlist in enumerate(playlists):
+            try:
+                urls = playlist.read_text().split("\n")
+            except FileNotFoundError:
+                if index == 0:
+                    raise  # Without the current playlist, do not guess what is safe.
+                continue  # Pending/sync playlists can be absent between batches.
+            for url in urls:
+                # Match normalize_url + cache_path_for_url, including signed URLs.
+                url = url.replace("\r", "").rstrip().rstrip(",")
+                if url:
+                    names.add(url.split("?", 1)[0].rsplit("/", 1)[-1])
+        return names
+
+    used = usage_bytes()
+    if used <= limit_mb * 1024 * 1024:
+        return
+
+    # The publication lock keeps this snapshot valid throughout deletion. Never
+    # remove metadata, partial downloads, locks, directories, or symlinks.
+    protected = protected_names()
+    candidates = []
+    with os.scandir(assets) as entries:
+        for entry in entries:
+            if entry.name.endswith((".txt", ".json", ".cursor", ".tmp", ".lock")):
+                continue
+            try:
+                info = entry.stat(follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            if stat.S_ISREG(info.st_mode) and info.st_nlink == 1:
+                candidates.append((info.st_mtime_ns, entry.name, info))
+    candidates.sort(key=lambda item: (item[0], item[1]))
+
+    log(f"{used / 1024 / 1024:.1f}MB used, trimming to {target_mb}MB")
+    deleted = 0
+    for _, name, original in candidates:
+        if used <= target_bytes:
+            # Account for concurrent downloads without rescanning after every file.
+            used = usage_bytes()
+            if used <= target_bytes:
+                break
+        path = assets / name
+        if name in protected or Path(str(path) + ".lock").exists() or Path(str(path) + ".tmp").exists():
+            continue
+        try:
+            current = path.lstat()
+            if (current.st_dev, current.st_ino, current.st_mtime_ns, current.st_ctime_ns) != (
+                    original.st_dev, original.st_ino, original.st_mtime_ns, original.st_ctime_ns):
+                continue  # Do not delete a file replaced/changed since the scan.
+            path.unlink()
+        except FileNotFoundError:
+            continue
+        used -= current.st_blocks * 512
+        deleted += 1
+
+    used = usage_bytes()
+    log(f"removed {deleted} file(s); {used / 1024 / 1024:.1f}MB remaining")
+    if used > target_bytes:
+        log("target not reached; leaving protected/in-use files intact")
+
+
+try:
+    with open(sys.argv[3], "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        cleanup()
+except (OSError, ValueError, subprocess.SubprocessError) as error:
+    print(f"Cache cleanup failed: {error}", file=sys.stderr)
+    sys.exit(1)
+PY
+  then
+    log "WARN: cache cleanup stopped; continuing playback"
   fi
-
-  log "Cache cleanup: ${used_mb}MB used, trimming to ${MAX_CACHE_MB}MB"
-
-  find "$ASSET_DIR" -type f ! -name 'main.txt' -printf '%T@ %p\n' \
-    | sort -n \
-    | while read -r _ file; do
-        rm -f "$file"
-        used_mb=$(du -sm "$ASSET_DIR" | awk '{print $1}')
-        (( used_mb <= MAX_CACHE_MB )) && break
-      done
 }
 
 # Only the main playback process promotes lists. Hash validation rejects mismatched metadata.
