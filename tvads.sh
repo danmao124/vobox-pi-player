@@ -3,7 +3,7 @@ set -euo pipefail
 
 # Bump for each player release, including changes to playback_report.py.
 # Captured by the running process; updating files takes effect after restart.
-readonly PLAYER_VERSION="2026.09.26.1"
+readonly PLAYER_VERSION="2026.09.27.1"
 
 CONFIG="/data/player/config.env"
 STATE_DIR="/tmp/player/state"
@@ -401,6 +401,8 @@ start_asset_download_bg() {
   # Stale lock / leftover partial from a previous crash
   rm -f "$lock" "$tmp" >/dev/null 2>&1 || true
 
+  # Redirect the background subshell itself so it cannot hold open the stdout
+  # pipe captured by src="$(cache_asset ...)" in the playback loop.
   (
     set +e
     local curl_pid rc=1
@@ -424,9 +426,9 @@ start_asset_download_bg() {
         note_fetch_reach_failure "asset download failed and ping 8.8.8.8 failed"
       fi
     fi
-  ) &
+  ) >&2 &
   disown || true
-  log "Queued download: $url"
+  log "Queued download: $url" >&2
 }
 
 batch_has_downloads_in_progress() {
@@ -1255,8 +1257,8 @@ main() {
         break
       fi
       if apply_sync_if_due; then
-        played_any=0
-        break
+        sync_web_kiosk
+        continue 2
       fi
       url="$(normalize_url "$url")"
       [[ -n "$url" ]] || continue
@@ -1265,8 +1267,7 @@ main() {
       play_url "$url" || play_rc=$?
       python3 "$SCRIPT_DIR/playback_report.py" finish "$PLAYBACK_HISTORY" || true
       if (( play_rc == 2 )); then
-        # Sync interrupt during asset; apply and restart batch
-        apply_sync_if_due || true
+        # Apply below the asset loop so a ready sync restarts without retry delay.
         played_any=0
         break
       elif (( play_rc == 0 )); then
