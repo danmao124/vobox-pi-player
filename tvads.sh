@@ -3,7 +3,7 @@ set -euo pipefail
 
 # Bump for each player release, including changes to playback_report.py.
 # Captured by the running process; updating files takes effect after restart.
-readonly PLAYER_VERSION="2026.09.21.1"
+readonly PLAYER_VERSION="2026.09.26.1"
 
 CONFIG="/data/player/config.env"
 STATE_DIR="/tmp/player/state"
@@ -641,9 +641,25 @@ seconds_until_event_slot() {
 }
 
 build_event_body() {
-  local playback_body
+  local playback_body web_station
   playback_body="$(python3 "$SCRIPT_DIR/playback_report.py" snapshot "$PLAYBACK_HISTORY" 2>/dev/null || echo "{}")"
-  jq -c --arg version "$PLAYER_VERSION" '. + {playerVersion: $version}' <<<"$playback_body"
+  # Trim + uppercase web station ids (same normalization as server-side billboard).
+  web_station="$(printf '%s' "${WEB_STATION:-}" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//' | tr '[:lower:]' '[:upper:]')"
+  if [[ -n "$web_station" ]]; then
+    jq -c \
+      --arg version "$PLAYER_VERSION" \
+      --arg adStationId "$ID" \
+      --arg webStationId "$web_station" \
+      '. + {playerVersion: $version, adStationId: $adStationId, webStationId: $webStationId}' \
+      <<<"$playback_body"
+  else
+    # Omit webStationId so the server leaves any stored value unchanged.
+    jq -c \
+      --arg version "$PLAYER_VERSION" \
+      --arg adStationId "$ID" \
+      '. + {playerVersion: $version, adStationId: $adStationId}' \
+      <<<"$playback_body"
+  fi
 }
 
 ask_for_event() {
