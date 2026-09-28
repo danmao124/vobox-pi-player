@@ -3,7 +3,7 @@ set -euo pipefail
 
 # Bump for each player release, including changes to playback_report.py.
 # Captured by the running process; updating files takes effect after restart.
-readonly PLAYER_VERSION="2026.09.27.1"
+readonly PLAYER_VERSION="2026.09.28.1"
 
 CONFIG="/data/player/config.env"
 STATE_DIR="/tmp/player/state"
@@ -295,9 +295,8 @@ fetch_batch_to() {
   local nextblastfile="$5"
 
   local url="${API_BASE}/${VIEW_PATH}?id=${ID}&index=${idx}&blastIndex=${blast_idx}"
-  if [[ -n "$WEB_STATION" ]]; then
-    url="${url}&webStationId=${WEB_STATION}"
-  fi
+  # Send an empty value explicitly so the server can clear a previous station.
+  url="${url}&webStationId=${WEB_STATION}"
   log "Fetch: $url"
 
   build_curl_auth_headers ""
@@ -647,21 +646,13 @@ build_event_body() {
   playback_body="$(python3 "$SCRIPT_DIR/playback_report.py" snapshot "$PLAYBACK_HISTORY" 2>/dev/null || echo "{}")"
   # Trim + uppercase web station ids (same normalization as server-side billboard).
   web_station="$(printf '%s' "${WEB_STATION:-}" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//' | tr '[:lower:]' '[:upper:]')"
-  if [[ -n "$web_station" ]]; then
-    jq -c \
-      --arg version "$PLAYER_VERSION" \
-      --arg adStationId "$ID" \
-      --arg webStationId "$web_station" \
-      '. + {playerVersion: $version, adStationId: $adStationId, webStationId: $webStationId}' \
-      <<<"$playback_body"
-  else
-    # Omit webStationId so the server leaves any stored value unchanged.
-    jq -c \
-      --arg version "$PLAYER_VERSION" \
-      --arg adStationId "$ID" \
-      '. + {playerVersion: $version, adStationId: $adStationId}' \
-      <<<"$playback_body"
-  fi
+  # Include empty webStationId to clear any stored value on the server.
+  jq -c \
+    --arg version "$PLAYER_VERSION" \
+    --arg adStationId "$ID" \
+    --arg webStationId "$web_station" \
+    '. + {playerVersion: $version, adStationId: $adStationId, webStationId: $webStationId}' \
+    <<<"$playback_body"
 }
 
 ask_for_event() {
