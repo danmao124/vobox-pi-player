@@ -3,7 +3,7 @@ set -euo pipefail
 
 # Bump for each player release, including changes to playback_report.py.
 # Captured by the running process; updating files takes effect after restart.
-readonly PLAYER_VERSION="2026.09.28.1"
+readonly PLAYER_VERSION="2026.09.28.2"
 
 CONFIG="/data/player/config.env"
 STATE_DIR="/tmp/player/state"
@@ -655,6 +655,59 @@ build_event_body() {
     <<<"$playback_body"
 }
 
+# Save a WPA personal profile, including networks that are not currently in range.
+# Requires passwordless sudo for /usr/bin/nmcli (also used by network recovery).
+# Do not activate it here: NetworkManager can autoconnect when Wi-Fi is idle.
+set_wifi_profile() {
+  local command="$1" ssid password profile rc=0
+  if ! jq -e '
+    .data | select(type == "object")
+    | select((.ssid | type) == "string" and (.password | type) == "string")
+    | (.ssid | utf8bytelength) as $size
+    | ($size >= 1 and $size <= 32)
+      and (.ssid | index("\u0000") == null)
+      and (.password | test("\\A([ -~]{8,63}|[0-9a-fA-F]{64})\\z"))
+  ' <<<"$command" >/dev/null 2>&1; then
+    log "WARN: setWifi requires an SSID (1-32 bytes) and a WPA password (8-63 printable ASCII characters or 64 hex digits); ignoring"
+    return 1
+  fi
+
+  # NUL delimiters preserve spaces, backslashes and trailing newlines in SSIDs.
+  # Keep the values as separate arguments; never evaluate credentials as shell code.
+  {
+    IFS= read -r -d '' ssid
+    IFS= read -r -d '' password
+  } < <(jq -j '.data.ssid, "\u0000", .data.password, "\u0000"' <<<"$command")
+  profile="vobox-wifi-${ssid}"
+
+  # Stable name per SSID makes repeated commands update the same managed profile.
+  sudo -n nmcli --wait 10 connection show id "$profile" >/dev/null 2>&1 || rc=$?
+  local -a nm_args
+  case "$rc" in
+    0) nm_args=(connection modify id "$profile") ;;
+    10) nm_args=(connection add save yes type wifi ifname '*' con-name "$profile") ;;
+    *)
+      log "WARN: setWifi could not read Wi-Fi profiles (exit ${rc}); check NetworkManager and passwordless sudo for nmcli"
+      return 1
+      ;;
+  esac
+
+  # Suppress nmcli output because validation errors can echo credential values.
+  rc=0
+  sudo -n nmcli --wait 10 "${nm_args[@]}" \
+    connection.autoconnect yes \
+    802-11-wireless.ssid "$ssid" \
+    802-11-wireless.mode infrastructure \
+    802-11-wireless-security.key-mgmt wpa-psk \
+    802-11-wireless-security.psk "$password" \
+    802-11-wireless-security.psk-flags 0 >/dev/null 2>&1 || rc=$?
+  if (( rc != 0 )); then
+    log "WARN: setWifi could not save Wi-Fi profile (exit ${rc}); check NetworkManager and passwordless sudo for nmcli"
+    return 1
+  fi
+  log "setWifi: saved Wi-Fi profile (autoconnect enabled)"
+}
+
 ask_for_event() {
   local url body json curl_rc=0
   url="${API_BASE}/${ASK_FOR_EVENT_PATH}"
@@ -701,10 +754,20 @@ ask_for_event() {
     | @tsv
   ' <<<"$json" 2>/dev/null || true)
 
-  # Log other command types for now
+  # Apply every Wi-Fi command in queue order; one bad profile must not stop polling.
+  local wifi_command
+  while IFS= read -r wifi_command; do
+    set_wifi_profile "$wifi_command" || true
+  done < <(jq -c '
+    .response | select(.success == true)
+    | (.data // [])[]
+    | select((.type // "") == "setWifi")
+  ' <<<"$json" 2>/dev/null || true)
+
+  # Log unsupported command types.
   jq -r '
     (.response.data // [])[]
-    | select((.type // "") != "sync")
+    | select((.type // "") != "sync" and (.type // "") != "setWifi")
     | "askForEvent: ignoring type=\(.type // "?")"
   ' <<<"$json" 2>/dev/null | while IFS= read -r line; do
     [[ -n "$line" ]] && log "$line"
