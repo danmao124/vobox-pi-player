@@ -3,7 +3,7 @@ set -euo pipefail
 
 # Bump for each player release, including changes to playback_report.py.
 # Captured by the running process; updating files takes effect after restart.
-readonly PLAYER_VERSION="2026.09.28.2"
+readonly PLAYER_VERSION="2026.10.01.1"
 
 CONFIG="/data/player/config.env"
 STATE_DIR="/tmp/player/state"
@@ -692,10 +692,12 @@ set_wifi_profile() {
       ;;
   esac
 
+  # Zero autoconnect retries means retry forever, including on existing profiles.
   # Suppress nmcli output because validation errors can echo credential values.
   rc=0
   sudo -n nmcli --wait 10 "${nm_args[@]}" \
     connection.autoconnect yes \
+    connection.autoconnect-retries 0 \
     802-11-wireless.ssid "$ssid" \
     802-11-wireless.mode infrastructure \
     802-11-wireless-security.key-mgmt wpa-psk \
@@ -705,7 +707,7 @@ set_wifi_profile() {
     log "WARN: setWifi could not save Wi-Fi profile (exit ${rc}); check NetworkManager and passwordless sudo for nmcli"
     return 1
   fi
-  log "setWifi: saved Wi-Fi profile (autoconnect enabled)"
+  log "setWifi: saved Wi-Fi profile (autoconnect enabled, retries forever)"
 }
 
 ask_for_event() {

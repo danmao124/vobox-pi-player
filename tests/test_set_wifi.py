@@ -123,6 +123,7 @@ echo poll-continues
         output = self.poll([wifi_command()])
         self.assertEqual(self.profiles(), {"vobox-wifi-VenueGuest": {
             "connection.autoconnect": "yes",
+            "connection.autoconnect-retries": "0",
             "802-11-wireless.ssid": "VenueGuest",
             "802-11-wireless.mode": "infrastructure",
             "802-11-wireless-security.key-mgmt": "wpa-psk",
@@ -136,11 +137,19 @@ echo poll-continues
 
     def test_repeated_ssid_updates_password_without_duplicate_profiles(self):
         self.poll([wifi_command(), wifi_command(password="updated-password")])
+        # An older profile's disabled autoconnect/finite retries are updated too.
+        profiles = self.profiles()
+        profiles["vobox-wifi-VenueGuest"].update({
+            "connection.autoconnect": "no", "connection.autoconnect-retries": "4",
+        })
+        self.write_json("profiles.json", profiles)
         # A later poll (or player restart) must find the same saved profile.
         self.poll([wifi_command(password="latest-password")])
         self.assertEqual(len(self.profiles()), 1)
         self.assertEqual(self.profiles()["vobox-wifi-VenueGuest"]["802-11-wireless-security.psk"],
                          "latest-password")
+        self.assertEqual(self.profiles()["vobox-wifi-VenueGuest"]["connection.autoconnect"], "yes")
+        self.assertEqual(self.profiles()["vobox-wifi-VenueGuest"]["connection.autoconnect-retries"], "0")
         self.assertEqual([call[5] for call in self.calls()],
                          ["show", "add", "show", "modify", "show", "modify"])
 
