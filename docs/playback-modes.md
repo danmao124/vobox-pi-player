@@ -1,6 +1,6 @@
 # Native and Chromium playback
 
-Release `2026.10.08.2` reads the boolean `response.hasYoutube` from successful
+Release `2026.10.08.3` reads the boolean `response.hasYoutube` from successful
 `view/billboard` and `device/askforevent` responses. The backend evaluates the
 whole currently eligible station playlist, including applicable default/blast
 items, rather than only the returned batch.
@@ -18,6 +18,21 @@ to 16 distinct stations. Multiple stations always use Chromium, including when
 `hasYoutube` is false, so all panels remain visible. Removing a station from the
 configuration takes effect on restart. A single remaining station resumes the
 normal YouTube-based renderer selection.
+
+To enable Chromium audio for one station, set `UNMUTED_ID` in the same config:
+
+```sh
+ID="baby,pepe"
+UNMUTED_ID="baby"
+```
+
+With `API_BASE="https://venditt.com/api/v1/user"`, this launches
+`https://venditt.com/ads/BABY%2CPEPE` with `unmute=BABY` alongside the kiosk
+authentication parameters. Only BABY is unmuted; PEPE remains muted. The setting
+is trimmed and matched case-insensitively against `ID`. Blank, omitted, or
+unmatched values omit `unmute` entirely, keeping all Chromium ad panels muted.
+Set only one station ID. Restart the player service after changing the config.
+This setting controls the `/ads` browser page; mpv audio behavior is unchanged.
 
 The native heartbeat runs immediately after startup and then once per minute in
 the device's existing slot. It continues while Chromium is active. Browser mode

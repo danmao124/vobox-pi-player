@@ -3,7 +3,7 @@ set -euo pipefail
 
 # Bump for each player release, including changes to playback_report.py.
 # Captured by the running process; updating files takes effect after restart.
-readonly PLAYER_VERSION="2026.10.08.2"
+readonly PLAYER_VERSION="2026.10.08.3"
 
 CONFIG="/data/player/config.env"
 STATE_DIR="/tmp/player/state"
@@ -91,6 +91,7 @@ IMAGE_SECONDS="${IMAGE_SECONDS:-15}"
 MAX_CACHE_MB="${MAX_CACHE_MB:-30000}" # Trim above this limit to 90%; keep active assets.
 ORIENTATION="${ORIENTATION:-0}"  # Screen orientation: 0, 90, 180, or 270
 WEB_STATION="${WEB_STATION:-}"  # Optional web station id
+UNMUTED_ID="${UNMUTED_ID:-}"  # Optional ad station to unmute in Chromium; blank keeps all muted.
 
 # Device auth (same as api_client.py): device_id = hostname, secret = /etc/machine-id
 DEVICE_ID="$(hostname)"
@@ -1165,8 +1166,11 @@ launch_web_kiosk() {
   if [[ "$web_content" == "ads" ]]; then
     local kiosk_query
     kiosk_query="$(jq -rn --arg deviceId "$DEVICE_ID" --arg secret "$DEVICE_SECRET" \
-      --arg playbackSession "$PLAYBACK_SESSION" \
-      '{kiosk:"1",deviceId:$deviceId,secret:$secret,playbackSession:$playbackSession}
+      --arg playbackSession "$PLAYBACK_SESSION" --arg stations "$ID" --arg unmutedId "${UNMUTED_ID:-}" \
+      '($unmutedId | ascii_upcase | gsub("^\\s+|\\s+$"; "")) as $unmute
+       | {kiosk:"1",deviceId:$deviceId,secret:$secret,playbackSession:$playbackSession}
+       + (if $unmute != "" and (($stations | split(",") | index($unmute)) != null)
+          then {unmute:$unmute} else {} end)
        | to_entries | map((.key | @uri) + "=" + (.value | @uri)) | join("&")')"
     kiosk_url="https://${api_host}/ads/$(jq -rn --arg id "$ID" '$id | @uri')?${kiosk_query}"
     # /ads handles the complete mixed playlist. Rotate the display because this
