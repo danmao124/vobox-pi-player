@@ -3,7 +3,7 @@ set -euo pipefail
 
 # Bump for each player release, including changes to playback_report.py.
 # Captured by the running process; updating files takes effect after restart.
-readonly PLAYER_VERSION="2026.10.01.1"
+readonly PLAYER_VERSION="2026.10.08.1"
 
 CONFIG="/data/player/config.env"
 STATE_DIR="/tmp/player/state"
@@ -38,6 +38,7 @@ WIFI_WIZARD_SCRIPT="${SCRIPT_DIR}/wifi_wizard.sh"
 
 # mpv IPC socket (lives in RAM; fine)
 MPV_SOCK="/tmp/venditt-mpv.sock"
+MPV_LAYOUT_ORIENTATION=""
 CHROMIUM_PID=""
 WIFI_HOTKEY_PID=""
 # Top-level PID so background fetches can nuke the whole player for a clean systemd restart
@@ -342,7 +343,9 @@ fetch_batch_to() {
   playlist_hash="$(openssl dgst -sha256 -r "$list_tmp" | awk '{print $1}')"
   jq -nc --arg hash "$playlist_hash" --arg next "$(cat "$nextfile")" \
     --arg blast "$(cat "$nextblastfile")" \
-    '{playlistHash:$hash,nextIndex:($next|tonumber),nextBlastIndex:($blast|tonumber)}' > "${out}.cursor"
+    --arg station "$ID" --argjson orientation "$(jq -c '.response.orientation // null' <<<"$json")" \
+    '{playlistHash:$hash,nextIndex:($next|tonumber),nextBlastIndex:($blast|tonumber),
+      stationId:($station|ascii_upcase),orientation:$orientation}' > "${out}.cursor"
   if ! with_cache_lock mv -f "$list_tmp" "$out"; then
     rm -f "$list_tmp"
     return 1
@@ -918,6 +921,103 @@ swap_pending_if_any() {
 }
 
 # ---------------- mpv IPC ----------------
+# Keep geometry with its playlist (including sync, offline replay and prefetch),
+# and never reuse another station's cached ratio after a config change.
+station_orientation() {
+  local hash
+  [[ -s "$MAIN_LIST" && -f "${MAIN_LIST}.cursor" ]] || return 0
+  hash="$(openssl dgst -sha256 -r "$MAIN_LIST" 2>/dev/null | awk '{print $1}')" || return 0
+  jq -r --arg hash "$hash" --arg station "$ID" '
+    select(.playlistHash == $hash and .stationId == ($station|ascii_upcase))
+    | .orientation | select(type == "string") | select(length <= 64)
+    | gsub("^\\s+|\\s+$"; "")
+    | select(. == "portrait" or . == "landscape" or test("^[0-9.]+[ ]*:[ ]*[0-9.]+$"))
+  ' "${MAIN_LIST}.cursor" 2>/dev/null || true
+}
+
+# Embedded so existing tvads.sh deployments need no extra runtime files.
+# mpv's margins reserve the station canvas on the GPU; keepaspect fits each
+# image/video inside it without introducing a CPU scale/pad filter.
+write_mpv_layout_script() {
+  cat > "${STATE_DIR}/station-layout.lua" <<'LUA'
+local mp = require 'mp'
+local options = { ratio = '' }
+require('mp.options').read_options(options, 'station-layout')
+
+local function parse_ratio(value)
+    if value == 'portrait' then return 9 / 16 end
+    if value == 'landscape' then return 16 / 9 end
+    if type(value) ~= 'string' or #value > 64 then return nil end
+    local w, h = value:match('^%s*([%d.]+)%s*:%s*([%d.]+)%s*$')
+    local function component(part)
+        if not part or not (part:match('^%d+$') or part:match('^%d+%.%d+$')) then return nil end
+        local fraction = part:match('%.(%d+)$')
+        local n = tonumber(part)
+        if (fraction and #fraction > 3) or not n or n <= 0 or n > 10000 then return nil end
+        return math.floor(n * 1000 + 0.5)
+    end
+    w, h = component(w), component(h)
+    if not w or not h or w / h < 1 / 8 or w / h > 8 then return nil end
+    local a, b = w, h
+    while b ~= 0 do a, b = b, a % b end
+    if w / a > 1792 or h / a > 1792 then return nil end
+    return w / h
+end
+
+local ratio = parse_ratio(options.ratio)
+local function margin(side, value)
+    local name = 'video-margin-ratio-' .. side
+    if math.abs(mp.get_property_number(name, 0) - value) > 0.000000001 then
+        mp.set_property_number(name, value)
+    end
+end
+
+local function update_layout()
+    local dims = mp.get_property_native('osd-dimensions')
+    if not dims or not dims.w or not dims.h or dims.w <= 0 or dims.h <= 0 then return end
+    local screen = dims.aspect or (dims.w / dims.h)
+    if screen <= 0 then return end
+    local target = ratio
+    local rotation = mp.get_property_number('video-rotate', 0) % 180
+    if target and rotation == 90 then target = 1 / target end
+    local x, y = 0, 0
+    if target then
+        if screen > target then x = (1 - target / screen) / 2
+        else y = (1 - screen / target) / 2 end
+    end
+    margin('left', x)
+    margin('right', x)
+    margin('top', y)
+    margin('bottom', y)
+end
+
+-- mpv before 0.38 used --background itself for the color value.
+if mp.get_property_native('options/background-color') ~= nil then
+    mp.set_property('background', 'color')
+    mp.set_property('background-color', '#000000')
+else
+    mp.set_property('background', '#000000')
+end
+
+mp.register_script_message('station-aspect', function(value)
+    ratio = parse_ratio(value)
+    update_layout()
+end)
+mp.observe_property('osd-dimensions', 'native', update_layout)
+mp.observe_property('video-rotate', 'number', update_layout)
+update_layout()
+LUA
+}
+
+update_mpv_layout() {
+  local orientation
+  orientation="$(station_orientation)"
+  if [[ "$orientation" != "$MPV_LAYOUT_ORIENTATION" ]]; then
+    mpv_send "$(jq -nc --arg ratio "$orientation" '{command:["script-message","station-aspect",$ratio]}')"
+    MPV_LAYOUT_ORIENTATION="$orientation"
+  fi
+}
+
 mpv_send() {
   printf '%s\n' "$1" | socat - UNIX-CONNECT:"$MPV_SOCK" >/dev/null 2>&1 || true
 }
@@ -941,7 +1041,9 @@ start_mpv_if_needed() {
   fi
 
   rm -f "$MPV_SOCK" || true
-  log "Starting mpv (persistent fullscreen, IPC, rotation=${ORIENTATION}°)"
+  write_mpv_layout_script
+  MPV_LAYOUT_ORIENTATION="$(station_orientation)"
+  log "Starting mpv (persistent fullscreen, IPC, rotation=${ORIENTATION}°, ratio=${MPV_LAYOUT_ORIENTATION:-viewport})"
 
   mpv --fs --no-border --really-quiet \
     --hwdec=auto \
@@ -950,9 +1052,11 @@ start_mpv_if_needed() {
     --no-osc --cursor-autohide=always \
     --keep-open=always --keep-open-pause=no \
     --vo=gpu \
-    --keepaspect=no \
+    --keepaspect=yes \
     --panscan=0 \
     --no-config \
+    --script="${STATE_DIR}/station-layout.lua" \
+    --script-opts="station-layout-ratio=${MPV_LAYOUT_ORIENTATION}" \
     --reset-on-next-file=no \
     --video-rotate="$ORIENTATION" \
     --input-ipc-server="$MPV_SOCK" \
@@ -1028,6 +1132,7 @@ play_url() {
   wait_while_wizard
 
   start_mpv_if_needed
+  update_mpv_layout
 
   if is_video "$url"; then
     mpv_send '{"command":["set_property","loop-file","no"]}'
