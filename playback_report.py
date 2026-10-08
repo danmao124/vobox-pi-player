@@ -8,6 +8,7 @@ import socket
 import sys
 import time
 from pathlib import Path
+from playback_mode import browser_content
 
 WINDOW_MS = 120_000
 
@@ -80,8 +81,8 @@ def load_and_record(sock_path, src, playlist, position, history_path):
     raise RuntimeError("mpv did not confirm playback within 5 seconds")
 
 
-def wait_image(started_ns, duration, wizard_lock, sync_at, sync_list):
-    """Wait to a fixed image deadline; return 2 for the shell's sync cutover."""
+def wait_image(started_ns, duration, wizard_lock, sync_at, sync_list, mode_file="", station=""):
+    """Return 2 for a timed sync, or 3 when the backend requests Chromium."""
     seconds = float(duration)
     if not math.isfinite(seconds) or seconds < 0:
         raise ValueError("Image duration must be finite and non-negative")
@@ -91,6 +92,8 @@ def wait_image(started_ns, duration, wizard_lock, sync_at, sync_list):
     while True:
         if Path(wizard_lock).is_dir():
             return 0
+        if mode_file and browser_content(mode_file, station):
+            return 3
         try:
             at = Path(sync_at).read_text().strip()
             if at.isascii() and at.isdecimal() and Path(sync_list).stat().st_size > 0:

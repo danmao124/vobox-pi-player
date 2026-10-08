@@ -14,7 +14,7 @@ class PlayerVersionTests(unittest.TestCase):
         version_line = re.search(r'^readonly PLAYER_VERSION="[^"]+"$', source, re.M).group()
         body_function = "build_event_body() {" + source.split("build_event_body() {", 1)[1].split("\n}\n", 1)[0] + "\n}\n"
         script = version_line + "\n" + body_function + "\n" + (
-            f"SCRIPT_DIR=unused PLAYBACK_HISTORY=unused ID={ad_station_id!r} WEB_STATION={web_station!r}\n"
+            f"SCRIPT_DIR=unused PLAYBACK_HISTORY=unused PLAYBACK_SESSION=test-session ID={ad_station_id!r} WEB_STATION={web_station!r}\n"
             "python3() { " + snapshot_command + "; }\n"
             "build_event_body\n"
         )
@@ -29,6 +29,8 @@ class PlayerVersionTests(unittest.TestCase):
                 "playerVersion": version,
                 "adStationId": "OAKS-CARDCLUB",
                 "webStationId": "",
+                "playbackMode": "mpv",
+                "playbackSession": "test-session",
                 "playback": {"sampledAtMs": 123, "segments": []},
             },
         )
@@ -44,6 +46,8 @@ class PlayerVersionTests(unittest.TestCase):
                 "playerVersion": version,
                 "adStationId": "OAKS-CARDCLUB",
                 "webStationId": "BAY101-POKER-1",
+                "playbackMode": "mpv",
+                "playbackSession": "test-session",
             },
         )
 
@@ -51,6 +55,8 @@ class PlayerVersionTests(unittest.TestCase):
         body, version = self.heartbeat("return 1")
         self.assertEqual(body, {
             "playerVersion": version, "adStationId": "OAKS-CARDCLUB", "webStationId": "",
+            "playbackMode": "mpv",
+            "playbackSession": "test-session",
         })
 
     def test_whitespace_only_web_station_sends_explicit_empty_value(self):
@@ -65,7 +71,7 @@ class BillboardRequestTests(unittest.TestCase):
         for web_station in ("", "BAY101-POKER-1"):
             with self.subTest(web_station=web_station), tempfile.TemporaryDirectory() as d:
                 request = Path(d) / "request-args"
-                script = function + f"\nWEB_STATION={shlex.quote(web_station)}\nREQUEST={shlex.quote(str(request))}\n"
+                script = function + f"\nWEB_STATION={shlex.quote(web_station)}\nREQUEST={shlex.quote(str(request))}\nSCRIPT_DIR={shlex.quote(str(Path(__file__).resolve().parents[1]))}\n"
                 script += r'''
 API_BASE=https://example.com/api VIEW_PATH=view/billboard ID=OAKS-CARDCLUB
 CURL_API_OPTS=(--fail)

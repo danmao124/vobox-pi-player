@@ -3,7 +3,7 @@ set -euo pipefail
 
 # Bump for each player release, including changes to playback_report.py.
 # Captured by the running process; updating files takes effect after restart.
-readonly PLAYER_VERSION="2026.10.01.1"
+readonly PLAYER_VERSION="2026.10.08.1"
 
 CONFIG="/data/player/config.env"
 STATE_DIR="/tmp/player/state"
@@ -14,7 +14,8 @@ PENDING_LIST="${STATE_DIR}/pending.txt"
 INDEX_FILE="${STATE_DIR}/index.txt"
 NEXT_FILE="${STATE_DIR}/next.txt"
 NEXT_BLAST_FILE="${STATE_DIR}/nextblast.txt"
-WEB_CONTENT_FILE="${STATE_DIR}/webcontent.txt"
+PLAYBACK_MODE_FILE="${STATE_DIR}/playback-mode.json"
+ACTIVE_MODE_FILE="${STATE_DIR}/active-mode.txt"
 # On disk so background (detached) fetches share the streak with the main loop
 FAIL_STREAK_FILE="${STATE_DIR}/failstreak.txt"
 RECOVERY_LOCK="${STATE_DIR}/recovery.lock"
@@ -35,6 +36,8 @@ ASK_FOR_EVENT_PATH="device/askforevent"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WIFI_HOTKEY_SCRIPT="${SCRIPT_DIR}/wifi_hotkey.sh"
 WIFI_WIZARD_SCRIPT="${SCRIPT_DIR}/wifi_wizard.sh"
+# Identifies this renderer lifetime; stale browser tabs cannot report after a switch.
+readonly PLAYBACK_SESSION="$(python3 -c 'import uuid; print(uuid.uuid4())')"
 
 # mpv IPC socket (lives in RAM; fine)
 MPV_SOCK="/tmp/venditt-mpv.sock"
@@ -68,7 +71,8 @@ cleanup() {
   pkill -f "X :0" >/dev/null 2>&1 || true
   pkill -f "Xorg :0" >/dev/null 2>&1 || true
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+trap 'exit 0' INT TERM
 
 # ---------- load config ----------
 if [[ ! -f "$CONFIG" ]]; then
@@ -121,7 +125,6 @@ CURL_ASSET_OPTS=(--fail --silent --show-error --connect-timeout 5 --max-time 500
 JQ_URLS='.response.data[]?.url // empty'
 JQ_INDEX='.response.index // .response.message // empty'
 JQ_BLAST='.response.blastIndex // empty'
-JQ_WEBCONTENT='.response.webContent // empty'
 
 log(){ echo "[$(date '+%F %T')] $*"; }
 
@@ -287,6 +290,28 @@ with open(sys.argv[1], "a") as lock:
 PY
 }
 
+update_playback_mode() {
+  local json="$1" requested_at="$2"
+  if ! printf '%s' "$json" | python3 "$SCRIPT_DIR/playback_mode.py" update \
+    "$PLAYBACK_MODE_FILE" "$ID" "$requested_at"; then
+    log "WARN: could not update playback mode; retaining previous mode"
+  fi
+}
+
+# 'ads' selects the website's mixed image/video/YouTube station player.
+# Other values retain the existing web-station kiosk routes.
+requested_kiosk_content() {
+  [[ -f "$PLAYBACK_MODE_FILE" ]] || return 0
+  jq -r --arg station "$ID" '
+    select(.stationId == ($station | ascii_upcase | gsub("^\\s+|\\s+$"; "")))
+    | if .hasYoutube == true then "ads" else (.webContent // empty) end
+  ' "$PLAYBACK_MODE_FILE" 2>/dev/null || true
+}
+
+browser_requested() {
+  [[ -n "$(requested_kiosk_content)" ]]
+}
+
 fetch_batch_to() {
   local idx="$1"
   local blast_idx="$2"
@@ -300,7 +325,8 @@ fetch_batch_to() {
   log "Fetch: $url"
 
   build_curl_auth_headers ""
-  local json curl_rc=0
+  local json curl_rc=0 requested_at
+  requested_at="$(python3 "$SCRIPT_DIR/playback_mode.py" clock)"
   json="$(curl "${CURL_API_OPTS[@]}" "${curl_headers[@]}" "$url")" || curl_rc=$?
   if (( curl_rc != 0 )); then
     log "WARN: fetch failed (curl rc=$curl_rc); checking Google (8.8.8.8)..."
@@ -313,28 +339,28 @@ fetch_batch_to() {
   fi
   note_fetch_reach_ok
 
-  local urls next next_blast web_content
+  if ! jq -e '.response.success == true and (.response.data | type == "array")' \
+    <<<"$json" >/dev/null 2>&1; then
+    log "WARN: invalid playlist response; retaining current playlist and mode"
+    return 1
+  fi
+  # Billboard omits webContent when no web station is configured. Heartbeats,
+  # unlike billboard responses, can omit this field without changing schedules.
+  json="$(jq -c '.response |= . + {webContent: (.webContent // null)}' <<<"$json")"
+  update_playback_mode "$json" "$requested_at"
+
+  local urls next next_blast
   # normalize lines coming from API (fixes "a.png," and CRLF issues)
   urls="$(jq -r "$JQ_URLS" <<<"$json" \
     | sed -E 's/\r$//; s/[[:space:]]+$//; s/,+$//; /^$/d' || true)"
   next="$(jq -r "$JQ_INDEX" <<<"$json" | sed '/^$/d' || true)"
   next_blast="$(jq -r "$JQ_BLAST" <<<"$json" | sed '/^$/d' || true)"
-  web_content="$(jq -r "$JQ_WEBCONTENT" <<<"$json" | sed '/^$/d' || true)"
-
-  if [[ -n "$web_content" ]]; then
-    echo "$web_content" > "$WEB_CONTENT_FILE"
-  else
-    rm -f "$WEB_CONTENT_FILE"
-  fi
-
-  if [[ -z "$urls" ]]; then
-    log "WARN: no urls in response"
-    return 1
-  fi
 
   # Publish the complete list under the cleanup lock, including sync fetches.
   local list_tmp="${out}.tmp"
-  printf "%s\n" "$urls" > "$list_tmp"
+  # An empty successful playlist must replace old YouTube URLs when the last item is removed.
+  : > "$list_tmp"
+  [[ -z "$urls" ]] || printf "%s\n" "$urls" > "$list_tmp"
   [[ -n "$next" ]] && echo "$next" > "$nextfile" || echo "$idx" > "$nextfile"
   [[ -n "$next_blast" ]] && echo "$next_blast" > "$nextblastfile" || echo "$blast_idx" > "$nextblastfile"
   # Keep the next cursor with this exact playlist, independent of prefetch advancement.
@@ -540,6 +566,9 @@ arm_sync_command() {
   local sync_blast_idx="${3:-$blast_idx}"
   local at url
 
+  # Chromium owns its playlist and cannot report/apply mpv's timed sync cursor.
+  browser_requested && return 0
+
   if [[ -z "$idx" ]]; then
     log "WARN: sync command missing index; ignoring"
     return 1
@@ -555,6 +584,10 @@ arm_sync_command() {
     log "WARN: sync fetch failed for index=${idx}"
     clear_sync_pending
     return 1
+  fi
+  if browser_requested; then
+    clear_sync_pending
+    return 0
   fi
   echo "$at" > "$SYNC_AT_FILE"
 
@@ -642,8 +675,13 @@ seconds_until_event_slot() {
 }
 
 build_event_body() {
-  local playback_body web_station
-  playback_body="$(python3 "$SCRIPT_DIR/playback_report.py" snapshot "$PLAYBACK_HISTORY" 2>/dev/null || echo "{}")"
+  local playback_body web_station playback_mode
+  playback_mode="$(cat "${ACTIVE_MODE_FILE:-/dev/null}" 2>/dev/null || true)"
+  [[ "$playback_mode" == "chromium" ]] || playback_mode="mpv"
+  playback_body="{}"
+  if [[ "$playback_mode" == "mpv" ]]; then
+    playback_body="$(python3 "$SCRIPT_DIR/playback_report.py" snapshot "$PLAYBACK_HISTORY" 2>/dev/null || echo "{}")"
+  fi
   # Trim + uppercase web station ids (same normalization as server-side billboard).
   web_station="$(printf '%s' "${WEB_STATION:-}" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//' | tr '[:lower:]' '[:upper:]')"
   # Include empty webStationId to clear any stored value on the server.
@@ -651,7 +689,9 @@ build_event_body() {
     --arg version "$PLAYER_VERSION" \
     --arg adStationId "$ID" \
     --arg webStationId "$web_station" \
-    '. + {playerVersion: $version, adStationId: $adStationId, webStationId: $webStationId}' \
+    --arg playbackMode "$playback_mode" \
+    --arg playbackSession "$PLAYBACK_SESSION" \
+    '. + {playerVersion: $version, adStationId: $adStationId, webStationId: $webStationId, playbackMode: $playbackMode, playbackSession: $playbackSession}' \
     <<<"$playback_body"
 }
 
@@ -711,11 +751,12 @@ set_wifi_profile() {
 }
 
 ask_for_event() {
-  local url body json curl_rc=0
+  local url body json curl_rc=0 requested_at
   url="${API_BASE}/${ASK_FOR_EVENT_PATH}"
   body="$(build_event_body)"
 
   build_curl_auth_headers "$body"
+  requested_at="$(python3 "$SCRIPT_DIR/playback_mode.py" clock)"
   json="$(curl "${CURL_API_OPTS[@]}" -X POST \
     -H "Content-Type: application/json" \
     -d "$body" \
@@ -732,6 +773,7 @@ ask_for_event() {
     return 1
   fi
   note_fetch_reach_ok
+  update_playback_mode "$json" "$requested_at"
 
   local count
   count="$(jq -r '(.response.data // []) | length' <<<"$json" 2>/dev/null || echo 0)"
@@ -778,6 +820,9 @@ ask_for_event() {
 
 event_poll_loop() {
   log "askForEvent schedule: second ${EVENT_SLOT}/60 each minute (machine-id slot)"
+  # Register this playback session immediately so the browser can report/sync.
+  ask_for_event || true
+  sleep 1
   while true; do
     local wait_s
     wait_s="$(seconds_until_event_slot)"
@@ -928,6 +973,8 @@ mpv_query() {
 
 start_mpv_if_needed() {
   wizard_active && return 0
+  # A heartbeat can change the desired mode between an asset check and launch.
+  browser_requested && return 3
 
   if [[ -S "$MPV_SOCK" ]]; then
     if ! mpv_query '{"command":["get_property","idle-active"]}' | grep -q '"data"'; then
@@ -994,6 +1041,7 @@ mpv_wait_until_eof_with_timeout() {
 
   while true; do
     wizard_active && return 0
+    browser_requested && return 3
     if sync_should_interrupt_playback; then
       wait_out_sync_deadline
       return 2
@@ -1009,10 +1057,11 @@ mpv_wait_until_eof_with_timeout() {
   done
 }
 
-# Returns 0 if something was shown, 1 if skipped (not cached yet / invalid), 2 if sync cutover.
+# Returns 0 if shown, 1 if skipped, 2 for sync cutover, 3 for browser cutover.
 play_url() {
   local url src playback_start
   url="$(normalize_url "$1")"
+  browser_requested && return 3
 
   # assert URL path has an extension (dot after the last '/')
   if [[ "${url%%\?*}" != */*.* ]]; then
@@ -1027,7 +1076,7 @@ play_url() {
 
   wait_while_wizard
 
-  start_mpv_if_needed
+  start_mpv_if_needed || return $?
 
   if is_video "$url"; then
     mpv_send '{"command":["set_property","loop-file","no"]}'
@@ -1051,13 +1100,16 @@ play_url() {
       mpv_wait_until_eof_with_timeout $((5 * 60)) || wait_rc=$?
     fi
     (( wait_rc == 2 )) && return 2
+    (( wait_rc == 3 )) && return 3
   else
     local image_wait_rc=0
     python3 "$SCRIPT_DIR/playback_report.py" wait-image "$playback_start" "$IMAGE_SECONDS" \
-      "$WIZARD_LOCK" "$SYNC_AT_FILE" "$SYNC_LIST" || image_wait_rc=$?
+      "$WIZARD_LOCK" "$SYNC_AT_FILE" "$SYNC_LIST" "$PLAYBACK_MODE_FILE" "$ID" || image_wait_rc=$?
     if (( image_wait_rc == 2 )); then
       wait_out_sync_deadline
       return 2
+    elif (( image_wait_rc == 3 )); then
+      return 3
     elif (( image_wait_rc == 0 )); then
       return 0
     fi
@@ -1067,6 +1119,7 @@ play_url() {
     local i=0 ticks=$((IMAGE_SECONDS * 5))
     while (( i < ticks )); do
       wizard_active && return 0
+      browser_requested && return 3
       if sync_should_interrupt_playback; then
         wait_out_sync_deadline
         return 2
@@ -1092,9 +1145,25 @@ kiosk_startx_alive() {
 
 launch_web_kiosk() {
   local web_content="$1"
-  local api_host
+  local api_host kiosk_url rotate="normal"
   api_host="$(echo "$API_BASE" | sed -E 's|^https?://||; s|/.*||')"
-  local kiosk_url="https://${api_host}/player/${ORIENTATION}/${web_content}?id=${WEB_STATION}&secret=${DEVICE_SECRET}"
+  if [[ "$web_content" == "ads" ]]; then
+    local kiosk_query
+    kiosk_query="$(jq -rn --arg deviceId "$DEVICE_ID" --arg secret "$DEVICE_SECRET" \
+      --arg playbackSession "$PLAYBACK_SESSION" \
+      '{kiosk:"1",deviceId:$deviceId,secret:$secret,playbackSession:$playbackSession}
+       | to_entries | map((.key | @uri) + "=" + (.value | @uri)) | join("&")')"
+    kiosk_url="https://${api_host}/ads/$(jq -rn --arg id "$ID" '$id | @uri')?${kiosk_query}"
+    # /ads handles the complete mixed playlist. Rotate the display because this
+    # route has no CSS rotation; the existing /player routes rotate themselves.
+    case "$ORIENTATION" in
+      90) rotate="right" ;;
+      180) rotate="inverted" ;;
+      270) rotate="left" ;;
+    esac
+  else
+    kiosk_url="https://${api_host}/player/${ORIENTATION}/${web_content}?id=${WEB_STATION}&secret=${DEVICE_SECRET}"
+  fi
 
   if kiosk_startx_alive && chromium_running; then
     return 0
@@ -1111,7 +1180,7 @@ launch_web_kiosk() {
     sleep 1
   fi
 
-  log "Launching Chromium kiosk: $kiosk_url"
+  log "Launching Chromium kiosk (content=${web_content}, rotation=${ORIENTATION}°)"
 
   rm -rf ~/.cache/chromium ~/.config/chromium
 
@@ -1127,6 +1196,7 @@ launch_web_kiosk() {
     --disable-infobars \
     --disable-session-crashed-bubble \
     --disable-dev-shm-usage \
+    --autoplay-policy=no-user-gesture-required \
     "$kiosk_url" \
     -- :0 -nocursor -s off &
   CHROMIUM_PID=$!
@@ -1138,6 +1208,13 @@ launch_web_kiosk() {
     export XAUTHORITY="${XAUTHORITY:-$HOME/.Xauthority}"
     for _ in {1..50}; do
       if xset q >/dev/null 2>&1; then
+        if [[ "$rotate" != "normal" ]]; then
+          local output
+          output="$(xrandr --query | awk '$2 == "connected" {print $1; exit}' || true)"
+          if [[ -z "$output" ]] || ! xrandr --output "$output" --rotate "$rotate"; then
+            log "WARN: could not rotate Chromium display to ${ORIENTATION}°"
+          fi
+        fi
         xset s off
         xset s noblank
         xset -dpms
@@ -1149,6 +1226,14 @@ launch_web_kiosk() {
     done
     log "WARN: could not disable display blanking (X not ready)"
   ) &
+
+  # The main loop checks kiosk health immediately; don't mistake startup for a crash.
+  for _ in {1..100}; do
+    chromium_running && return 0
+    kiosk_startx_alive || break
+    sleep 0.1
+  done
+  restart_player "Chromium kiosk failed to start"
 }
 
 kill_web_kiosk() {
@@ -1164,8 +1249,7 @@ kill_web_kiosk() {
   sleep 0.5
 }
 
-# Full process restart: cleanup trap tears down mpv/X; systemd Restart= brings us back cold
-# (X then mpv) — avoids mid-run startx fighting DRM mpv.
+# Full process restart releases DRM/X before the selected renderer takes the display.
 restart_player() {
   local reason="${1:-kiosk unhealthy}"
   log "WARN: $reason; exiting so systemd can restart the player"
@@ -1176,22 +1260,27 @@ restart_player() {
 # After Wi-Fi recovery, do a clean player restart rather than startx on a live DRM session.
 restart_web_kiosk_if_needed() {
   wizard_active && return 0
-  if [[ ! -f "$WEB_CONTENT_FILE" ]]; then
-    return 0
-  fi
+  browser_requested || return 0
   restart_player "network recovered; refreshing kiosk via full player restart"
 }
 
 # Set after the first intentional kiosk launch so "not running" means crash, not cold start.
 KIOSK_BOOTSTRAPPED=""
+ACTIVE_KIOSK_CONTENT=""
 # Set once mpv has taken DRM. Bringing Chromium up after that needs a full player restart.
 MPV_HAS_DISPLAY=""
 
 # Watchdog: launch once at boot; if Chromium dies later, nuke the whole player.
 ensure_web_kiosk_healthy() {
   wizard_active && return 0
+  local content
+  content="$(requested_kiosk_content)"
 
-  if [[ ! -f "$WEB_CONTENT_FILE" ]]; then
+  if [[ -n "$KIOSK_BOOTSTRAPPED" && "$content" != "$ACTIVE_KIOSK_CONTENT" ]]; then
+    restart_player "browser content changed; restarting to select the current playback mode"
+  fi
+
+  if [[ -z "$content" ]]; then
     if chromium_running || x_display_running || kiosk_startx_alive; then
       kill_web_kiosk
     fi
@@ -1201,14 +1290,14 @@ ensure_web_kiosk_healthy() {
 
   if chromium_running; then
     KIOSK_BOOTSTRAPPED=1
+    ACTIVE_KIOSK_CONTENT="$content"
     if ! kiosk_startx_alive; then
       CHROMIUM_PID=""
     fi
     return 0
   fi
 
-  # Cold start (before mpv): launch X first. After mpv owns DRM, or if Chromium
-  # crashed, systemd restart gives a clean X-then-mpv boot — no startx fight.
+  # A new renderer always starts with a clean display session.
   if [[ -n "$KIOSK_BOOTSTRAPPED" ]]; then
     restart_player "Chromium kiosk not running (crash or exit)"
   fi
@@ -1216,19 +1305,19 @@ ensure_web_kiosk_healthy() {
     restart_player "web content enabled; restarting player so kiosk can take the display"
   fi
 
-  launch_web_kiosk "$(cat "$WEB_CONTENT_FILE")"
+  launch_web_kiosk "$content"
+  ACTIVE_KIOSK_CONTENT="$content"
   KIOSK_BOOTSTRAPPED=1
 }
 
 sync_web_kiosk() {
   wizard_active && return 0
 
-  if [[ -f "$WEB_CONTENT_FILE" ]]; then
-    ensure_web_kiosk_healthy
-  else
-    kill_web_kiosk
-    KIOSK_BOOTSTRAPPED=""
-  fi
+  ensure_web_kiosk_healthy
+  local mode="mpv"
+  [[ -z "$KIOSK_BOOTSTRAPPED" ]] || mode="chromium"
+  printf '%s\n' "$mode" > "${ACTIVE_MODE_FILE}.tmp"
+  mv -f "${ACTIVE_MODE_FILE}.tmp" "$ACTIVE_MODE_FILE"
 }
 
 main() {
@@ -1239,9 +1328,6 @@ main() {
 
   log "Player version=${PLAYER_VERSION}"
   log "Device EVENT_SLOT=${EVENT_SLOT} (askForEvent during second ${EVENT_SLOT} of each minute)"
-  event_poll_loop &
-  disown || true
-
   idx="$(cat "$INDEX_FILE" 2>/dev/null || echo "0")"
   if fetch_batch_to "$idx" "$blast_idx" "$PENDING_LIST" "$NEXT_FILE" "$NEXT_BLAST_FILE"; then
     promote_main_list "$PENDING_LIST"
@@ -1253,23 +1339,54 @@ main() {
     else
       log "No persisted MAIN_LIST; retrying initial fetch..."
       until fetch_batch_to "$idx" "$blast_idx" "$PENDING_LIST" "$NEXT_FILE" "$NEXT_BLAST_FILE"; do
+        # A previously confirmed browser mode remains useful during API outages.
+        browser_requested && break
         sleep 5
         idx="$(cat "$INDEX_FILE" 2>/dev/null || echo "0")"
       done
-      promote_main_list "$PENDING_LIST"
-      mv "$NEXT_FILE" "$INDEX_FILE"
-      read_next_blast_index
+      if [[ -f "$NEXT_FILE" ]]; then
+        promote_main_list "$PENDING_LIST"
+        mv "$NEXT_FILE" "$INDEX_FILE"
+        read_next_blast_index
+      fi
     fi
   fi
 
   sync_web_kiosk
 
-  start_background_fetch_pending "$(cat "$INDEX_FILE" 2>/dev/null || echo "0")" "$blast_idx"
+  event_poll_loop &
+  disown || true
 
-  start_mpv_if_needed
+  if [[ -z "$KIOSK_BOOTSTRAPPED" ]]; then
+    start_background_fetch_pending "$(cat "$INDEX_FILE" 2>/dev/null || echo "0")" "$blast_idx"
+    local start_rc=0
+    start_mpv_if_needed || start_rc=$?
+    (( start_rc == 0 || start_rc == 3 )) || return "$start_rc"
+  fi
 
+  local browser_refreshed_at=0 browser_started_at browser_now
+  browser_started_at="$(date +%s)"
   while true; do
     wait_while_wizard
+    sync_web_kiosk
+
+    if [[ -n "$KIOSK_BOOTSTRAPPED" ]]; then
+      browser_now="$(date +%s)"
+      # Preserve the website's daily refresh through a full restart: reloading
+      # its scrubbed URL alone would lose the kiosk's in-memory credentials.
+      if [[ "$ACTIVE_KIOSK_CONTENT" == "ads" ]] && (( browser_now - browser_started_at >= 86400 )); then
+        restart_player "daily browser refresh with a new playback session"
+      fi
+      # Keep polling even though mpv's asset loop is paused. Heartbeats update
+      # hasYoutube; this also refreshes legacy web-station schedules once/minute.
+      if (( browser_now - browser_refreshed_at >= 60 )); then
+        browser_refreshed_at="$browser_now"
+        fetch_batch_to 0 0 "${STATE_DIR}/browser.txt" "${STATE_DIR}/browser-next.txt" \
+          "${STATE_DIR}/browser-blast.txt" || true
+      fi
+      sleep 1
+      continue
+    fi
 
     # If a sync deadline is near/past, wait it out and cut over before more ads.
     if sync_should_interrupt_playback; then
@@ -1288,10 +1405,13 @@ main() {
         mv "$NEXT_FILE" "$INDEX_FILE"
         read_next_blast_index
       else
-        log "No images available; waiting 60s before retry..."
+        log "Playlist fetch failed"
+      fi
+      if [[ ! -s "$MAIN_LIST" ]]; then
+        log "No images available; waiting up to 60s before retry..."
         local waited=0
         while (( waited < 60 )); do
-          if sync_should_interrupt_playback; then
+          if browser_requested || sync_should_interrupt_playback; then
             break
           fi
           sleep 1
@@ -1308,6 +1428,7 @@ main() {
 
     while IFS= read -r url; do
       wait_while_wizard
+      browser_requested && break
       if sync_should_interrupt_playback; then
         wait_out_sync_deadline
         break
@@ -1322,7 +1443,7 @@ main() {
       play_rc=0
       play_url "$url" || play_rc=$?
       python3 "$SCRIPT_DIR/playback_report.py" finish "$PLAYBACK_HISTORY" || true
-      if (( play_rc == 2 )); then
+      if (( play_rc == 2 || play_rc == 3 )); then
         # Apply below the asset loop so a ready sync restarts without retry delay.
         played_any=0
         break
@@ -1330,6 +1451,8 @@ main() {
         played_any=1
       fi
     done < "$MAIN_LIST"
+
+    browser_requested && continue
 
     if apply_sync_if_due; then
       sync_web_kiosk

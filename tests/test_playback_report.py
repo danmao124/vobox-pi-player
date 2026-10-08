@@ -154,6 +154,7 @@ class ShellSyncTests(unittest.TestCase):
         function = "play_url() {" + source.split("play_url() {", 1)[1].split("\n}\n", 1)[0] + "\n}\n"
         script = function + r"""
 normalize_url() { echo "$1"; }
+browser_requested() { return 1; }
 cache_asset() { echo asset.png; }
 wait_while_wizard() { :; }
 start_mpv_if_needed() { :; }
@@ -172,6 +173,7 @@ python3() {
 wait_out_sync_deadline() { echo waited-for-sync; }
 SCRIPT_DIR=unused MPV_SOCK=unused MAIN_LIST=unused item_position=1 PLAYBACK_HISTORY=unused
 IMAGE_SECONDS=15 WIZARD_LOCK=unused SYNC_AT_FILE=unused SYNC_LIST=unused
+PLAYBACK_MODE_FILE=unused ID=TEST
 rc=0
 play_url https://example.com/image.png || rc=$?
 echo "result=$rc"

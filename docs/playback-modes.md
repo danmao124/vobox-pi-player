@@ -1,0 +1,65 @@
+# Native and Chromium playback
+
+Release `2026.10.08.1` reads the boolean `response.hasYoutube` from successful
+`view/billboard` and `device/askforevent` responses. The backend evaluates the
+whole currently eligible station playlist, including applicable default/blast
+items, rather than only the returned batch.
+
+- `true` selects Chromium at `/ads/:id`, which plays the complete mixed playlist.
+- `false` selects mpv again, unless a separate web-station schedule still requests
+  a browser page through `webContent`.
+- Missing/malformed flags and failed requests preserve the last confirmed signal.
+  A successful empty playlist clears the previous playlist.
+
+The native heartbeat runs immediately after startup and then once per minute in
+the device's existing slot. It continues while Chromium is active. Browser mode
+also refreshes billboard metadata once per minute, including web schedules.
+Changes interrupt native image/video waits. The player exits and the existing
+systemd `Restart=always` policy restarts it, releasing mpv/X before starting the
+new renderer. Expect a brief display interruption, including the service's startup
+delay; this is not a seamless video transition.
+
+`playback-mode.json` in the state directory is shared with background fetches using
+a lock and atomic replacement. Request start times prevent an older response from
+undoing a newer signal. State is bound to the ad station and survives a service
+restart in `/tmp`; a machine reboot requires a fresh response to select Chromium.
+
+## Watchdog and manual sync
+
+Each player process creates a new `playbackSession`. Native heartbeats report it
+with `playbackMode: "mpv"` or `"chromium"`. mpv retains its existing confirmed
+playback reports and timed batch cutovers. Native heartbeats omit mpv telemetry
+in Chromium mode.
+
+The dedicated Chromium kiosk receives `kiosk=1`, `deviceId`, `secret`, and
+`playbackSession` in its launch URL. The website removes credentials from the URL
+and uses them in memory to sign `device/browserplayback` requests. Kiosk URLs are
+not written to player logs. Public `/ads` visitors do not enroll in device sync.
+The native supervisor refreshes the ad kiosk daily through a full service restart
+with a new session, rather than reloading a URL whose credentials were removed.
+
+The website reports actual image/video/YouTube playback using the same playlist
+hash, one-based item position, timestamps, and batch-bound next cursors as mpv.
+The backend accepts reports only for the registered Chromium session and station.
+It returns retained sync commands separately from the native command queue, so
+native polling and Wi-Fi commands continue without consuming the browser's sync.
+Both manual sync and the existing opt-in drift watchdog can target Chromium and
+mpv devices. As before, sync is an application-level correction, not a guarantee
+of frame-accurate decoding or YouTube network startup.
+
+## Deployment and verification
+
+Deploy the backend and website protocol support before enabling this player
+release. Deploy `tvads.sh`, `playback_report.py`, and `playback_mode.py` together
+and restart the player service. The existing service must restart on exit and
+terminate its entire control group. Chromium, `startx`, and `xset` are required;
+rotated ad displays also require `xrandr`. The player rotates `/ads` through X;
+existing `/player/:orientation/:command` pages retain their own CSS rotation.
+
+Run `python3 -m unittest discover -s tests` and `bash -n tvads.sh` locally. Tests
+use stubbed renderers, HTTP, and network commands. Before fleet rollout, check two
+physical Pis: add and remove the final YouTube entry, confirm both mode changes,
+check all deployed screen rotations, issue manual sync, and induce drift to
+verify watchdog recovery in each mode. Also verify mode changes during an image,
+during a long video, and after an API outage. Native tests cannot establish
+physical display handoff or real YouTube startup timing.

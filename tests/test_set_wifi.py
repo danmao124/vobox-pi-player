@@ -96,6 +96,7 @@ class SetWifiTests(unittest.TestCase):
         }})
         script = shell_function("set_wifi_profile") + shell_function("ask_for_event")
         script += f"\nWIFI_TEST_ROOT={shlex.quote(str(self.root))}\n"
+        script += f"SCRIPT_DIR={shlex.quote(str(ROOT))}\n"
         script += r'''
 API_BASE=https://example.com/api ASK_FOR_EVENT_PATH=device/askforevent
 LAST_SYNC_COMMAND=""
@@ -105,6 +106,7 @@ build_event_body() { echo '{}'; }
 build_curl_auth_headers() { curl_headers=(-H test-auth); }
 curl() { cat "$WIFI_TEST_ROOT/response.json"; }
 note_fetch_reach_ok() { :; }
+update_playback_mode() { :; }
 arm_sync_command() { printf 'SYNC %s %s %s\n' "$1" "$2" "$3"; }
 ask_for_event
 echo poll-continues
