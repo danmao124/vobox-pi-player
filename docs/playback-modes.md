@@ -1,15 +1,23 @@
 # Native and Chromium playback
 
-Release `2026.10.08.1` reads the boolean `response.hasYoutube` from successful
+Release `2026.10.08.2` reads the boolean `response.hasYoutube` from successful
 `view/billboard` and `device/askforevent` responses. The backend evaluates the
 whole currently eligible station playlist, including applicable default/blast
 items, rather than only the returned batch.
 
-- `true` selects Chromium at `/ads/:id`, which plays the complete mixed playlist.
-- `false` selects mpv again, unless a separate web-station schedule still requests
+- For one station, `true` selects Chromium at `/ads/:id`, which plays the complete mixed playlist.
+- For one station, `false` selects mpv again, unless a separate web-station schedule still requests
   a browser page through `webContent`.
 - Missing/malformed flags and failed requests preserve the last confirmed signal.
   A successful empty playlist clears the previous playlist.
+
+To play multiple independent station panels, set the comma-separated `ID` in
+`/data/player/config.env`, for example `ID="BAY101,MCB"`, then restart the service.
+The player trims whitespace, uppercases IDs, removes duplicates, and accepts up
+to 16 distinct stations. Multiple stations always use Chromium, including when
+`hasYoutube` is false, so all panels remain visible. Removing a station from the
+configuration takes effect on restart. A single remaining station resumes the
+normal YouTube-based renderer selection.
 
 The native heartbeat runs immediately after startup and then once per minute in
 the device's existing slot. It continues while Chromium is active. Browser mode
@@ -21,8 +29,9 @@ delay; this is not a seamless video transition.
 
 `playback-mode.json` in the state directory is shared with background fetches using
 a lock and atomic replacement. Request start times prevent an older response from
-undoing a newer signal. State is bound to the ad station and survives a service
-restart in `/tmp`; a machine reboot requires a fresh response to select Chromium.
+undoing a newer signal. State is bound to the configured station list and survives
+a service restart in `/tmp`; a single-station machine reboot requires a fresh
+response to select Chromium. Multiple stations start Chromium immediately.
 
 ## Watchdog and manual sync
 
@@ -30,6 +39,11 @@ Each player process creates a new `playbackSession`. Native heartbeats report it
 with `playbackMode: "mpv"` or `"chromium"`. mpv retains its existing confirmed
 playback reports and timed batch cutovers. Native heartbeats omit mpv telemetry
 in Chromium mode.
+
+Heartbeats register `adStationIds` for every panel and keep `adStationId` as the
+first station for compatibility. The heartbeat's `hasYoutube` is true if any
+registered station currently needs YouTube. Native billboard metadata requests
+still use the first station; each browser panel fetches its own playlist.
 
 The dedicated Chromium kiosk receives `kiosk=1`, `deviceId`, `secret`, and
 `playbackSession` in its launch URL. The website removes credentials from the URL
@@ -40,8 +54,12 @@ with a new session, rather than reloading a URL whose credentials were removed.
 
 The website reports actual image/video/YouTube playback using the same playlist
 hash, one-based item position, timestamps, and batch-bound next cursors as mpv.
-The backend accepts reports only for the registered Chromium session and station.
-It returns retained sync commands separately from the native command queue, so
+The backend accepts reports only for a whitelisted device's registered Chromium
+session and station membership. Each panel has its own reporting, history, sync
+timer, playlist cursor, and command deduplication. Sync commands carry
+`data.adStationId`; syncing BAY101 does not stop, reload, or reset MCB. Untagged
+legacy commands remain supported only for a single-station browser session.
+The backend returns retained sync commands separately from the native command queue, so
 native polling and Wi-Fi commands continue without consuming the browser's sync.
 Both manual sync and the existing opt-in drift watchdog can target Chromium and
 mpv devices. As before, sync is an application-level correction, not a guarantee
@@ -61,5 +79,8 @@ use stubbed renderers, HTTP, and network commands. Before fleet rollout, check t
 physical Pis: add and remove the final YouTube entry, confirm both mode changes,
 check all deployed screen rotations, issue manual sync, and induce drift to
 verify watchdog recovery in each mode. Also verify mode changes during an image,
-during a long video, and after an API outage. Native tests cannot establish
+during a long video, and after an API outage. With `ID="BAY101,MCB"`, sync each
+station separately and then both together; confirm the sibling keeps playing,
+including video/YouTube, and verify that removing a station rejects its old
+session's reports. Native tests cannot establish
 physical display handoff or real YouTube startup timing.

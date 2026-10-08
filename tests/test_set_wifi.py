@@ -98,7 +98,7 @@ class SetWifiTests(unittest.TestCase):
         script += f"\nWIFI_TEST_ROOT={shlex.quote(str(self.root))}\n"
         script += f"SCRIPT_DIR={shlex.quote(str(ROOT))}\n"
         script += r'''
-API_BASE=https://example.com/api ASK_FOR_EVENT_PATH=device/askforevent
+API_BASE=https://example.com/api ASK_FOR_EVENT_PATH=device/askforevent ID=STATION
 LAST_SYNC_COMMAND=""
 CURL_API_OPTS=(--fail)
 log() { echo "$*"; }

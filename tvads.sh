@@ -3,7 +3,7 @@ set -euo pipefail
 
 # Bump for each player release, including changes to playback_report.py.
 # Captured by the running process; updating files takes effect after restart.
-readonly PLAYER_VERSION="2026.10.08.1"
+readonly PLAYER_VERSION="2026.10.08.2"
 
 CONFIG="/data/player/config.env"
 STATE_DIR="/tmp/player/state"
@@ -84,6 +84,8 @@ source "$CONFIG"
 
 : "${API_BASE:?Missing API_BASE in config.env}"
 : "${ID:?Missing ID in config.env}"
+# One station retains native playback; a comma-separated list opens independent browser panels.
+ID="$(python3 "$SCRIPT_DIR/playback_mode.py" stations "$ID")"
 
 IMAGE_SECONDS="${IMAGE_SECONDS:-15}"
 MAX_CACHE_MB="${MAX_CACHE_MB:-30000}" # Trim above this limit to 90%; keep active assets.
@@ -301,6 +303,10 @@ update_playback_mode() {
 # 'ads' selects the website's mixed image/video/YouTube station player.
 # Other values retain the existing web-station kiosk routes.
 requested_kiosk_content() {
+  if [[ "$ID" == *,* ]]; then
+    printf '%s\n' ads
+    return 0
+  fi
   [[ -f "$PLAYBACK_MODE_FILE" ]] || return 0
   jq -r --arg station "$ID" '
     select(.stationId == ($station | ascii_upcase | gsub("^\\s+|\\s+$"; "")))
@@ -319,7 +325,11 @@ fetch_batch_to() {
   local nextfile="$4"
   local nextblastfile="$5"
 
-  local url="${API_BASE}/${VIEW_PATH}?id=${ID}&index=${idx}&blastIndex=${blast_idx}"
+  # This endpoint returns one playlist. The full station set is registered by
+  # the native heartbeat; browser panels fetch their own playlists independently.
+  local station
+  station="$(jq -rn --arg id "${ID%%,*}" '$id | @uri')"
+  local url="${API_BASE}/${VIEW_PATH}?id=${station}&index=${idx}&blastIndex=${blast_idx}"
   # Send an empty value explicitly so the server can clear a previous station.
   url="${url}&webStationId=${WEB_STATION}"
   log "Fetch: $url"
@@ -687,11 +697,12 @@ build_event_body() {
   # Include empty webStationId to clear any stored value on the server.
   jq -c \
     --arg version "$PLAYER_VERSION" \
-    --arg adStationId "$ID" \
+    --arg adStationId "${ID%%,*}" \
+    --argjson adStationIds "$(jq -cn --arg ids "$ID" '$ids | split(",")')" \
     --arg webStationId "$web_station" \
     --arg playbackMode "$playback_mode" \
     --arg playbackSession "$PLAYBACK_SESSION" \
-    '. + {playerVersion: $version, adStationId: $adStationId, webStationId: $webStationId, playbackMode: $playbackMode, playbackSession: $playbackSession}' \
+    '. + {playerVersion: $version, adStationId: $adStationId, adStationIds: $adStationIds, webStationId: $webStationId, playbackMode: $playbackMode, playbackSession: $playbackSession}' \
     <<<"$playback_body"
 }
 
@@ -787,9 +798,13 @@ ask_for_event() {
     if arm_sync_command "$idx" "$ts_raw" "$sync_blast_idx"; then
       LAST_SYNC_COMMAND="$idx|$ts_raw|$sync_blast_idx"
     fi
-  done < <(jq -r '
-    (.response.data // [])[]
+  done < <(jq -r --arg station "${ID%%,*}" '
+    .response | select(.success == true)
+    | (.data // [])[]
     | select((.type // "") == "sync")
+    | select(.data.adStationId == null or
+        ((.data.adStationId | type) == "string" and
+         (.data.adStationId | ascii_upcase | gsub("^\\s+|\\s+$"; "")) == $station))
     | [
         (.data.index // .data.Index // empty | tostring),
         (.data.timestamp // .data.Timestamp // empty | tostring),
@@ -1329,7 +1344,9 @@ main() {
   log "Player version=${PLAYER_VERSION}"
   log "Device EVENT_SLOT=${EVENT_SLOT} (askForEvent during second ${EVENT_SLOT} of each minute)"
   idx="$(cat "$INDEX_FILE" 2>/dev/null || echo "0")"
-  if fetch_batch_to "$idx" "$blast_idx" "$PENDING_LIST" "$NEXT_FILE" "$NEXT_BLAST_FILE"; then
+  if [[ "$ID" == *,* ]]; then
+    log "Starting independent Chromium panels for ad stations: $ID"
+  elif fetch_batch_to "$idx" "$blast_idx" "$PENDING_LIST" "$NEXT_FILE" "$NEXT_BLAST_FILE"; then
     promote_main_list "$PENDING_LIST"
     mv "$NEXT_FILE" "$INDEX_FILE"
     read_next_blast_index

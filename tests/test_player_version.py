@@ -28,6 +28,7 @@ class PlayerVersionTests(unittest.TestCase):
             {
                 "playerVersion": version,
                 "adStationId": "OAKS-CARDCLUB",
+                "adStationIds": ["OAKS-CARDCLUB"],
                 "webStationId": "",
                 "playbackMode": "mpv",
                 "playbackSession": "test-session",
@@ -45,6 +46,7 @@ class PlayerVersionTests(unittest.TestCase):
             {
                 "playerVersion": version,
                 "adStationId": "OAKS-CARDCLUB",
+                "adStationIds": ["OAKS-CARDCLUB"],
                 "webStationId": "BAY101-POKER-1",
                 "playbackMode": "mpv",
                 "playbackSession": "test-session",
@@ -55,6 +57,7 @@ class PlayerVersionTests(unittest.TestCase):
         body, version = self.heartbeat("return 1")
         self.assertEqual(body, {
             "playerVersion": version, "adStationId": "OAKS-CARDCLUB", "webStationId": "",
+            "adStationIds": ["OAKS-CARDCLUB"],
             "playbackMode": "mpv",
             "playbackSession": "test-session",
         })
@@ -63,17 +66,22 @@ class PlayerVersionTests(unittest.TestCase):
         body, _ = self.heartbeat("echo '{}'", web_station="   ")
         self.assertEqual(body["webStationId"], "")
 
+    def test_multi_station_heartbeat_registers_every_panel_with_legacy_primary(self):
+        body, _ = self.heartbeat("echo '{}'", ad_station_id="BAY101,MCB")
+        self.assertEqual(body["adStationId"], "BAY101")
+        self.assertEqual(body["adStationIds"], ["BAY101", "MCB"])
+
 
 class BillboardRequestTests(unittest.TestCase):
     def test_web_station_query_is_sent_even_when_empty(self):
         source = (Path(__file__).resolve().parents[1] / "tvads.sh").read_text()
         function = "fetch_batch_to() {" + source.split("fetch_batch_to() {", 1)[1].split("\n}\n", 1)[0] + "\n}\n"
-        for web_station in ("", "BAY101-POKER-1"):
-            with self.subTest(web_station=web_station), tempfile.TemporaryDirectory() as d:
+        for web_station, stations in (("", "OAKS-CARDCLUB"), ("BAY101-POKER-1", "OAKS-CARDCLUB"), ("", "OAKS-CARDCLUB,MCB")):
+            with self.subTest(web_station=web_station, stations=stations), tempfile.TemporaryDirectory() as d:
                 request = Path(d) / "request-args"
                 script = function + f"\nWEB_STATION={shlex.quote(web_station)}\nREQUEST={shlex.quote(str(request))}\nSCRIPT_DIR={shlex.quote(str(Path(__file__).resolve().parents[1]))}\n"
                 script += r'''
-API_BASE=https://example.com/api VIEW_PATH=view/billboard ID=OAKS-CARDCLUB
+API_BASE=https://example.com/api VIEW_PATH=view/billboard
 CURL_API_OPTS=(--fail)
 log() { :; }
 build_curl_auth_headers() { curl_headers=(-H test-auth); }
@@ -82,8 +90,8 @@ curl() {
   printf '%s\n' "$@" > "$REQUEST"
   return 22
 }
-fetch_batch_to 3 5 unused unused unused || true
 '''
+                script += f"ID={shlex.quote(stations)}\nfetch_batch_to 3 5 unused unused unused || true\n"
                 subprocess.run(["bash", "-euo", "pipefail", "-c", script],
                                capture_output=True, text=True, check=True)
                 url = request.read_text().splitlines()[-1]

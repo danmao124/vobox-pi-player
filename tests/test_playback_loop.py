@@ -108,7 +108,7 @@ class PlaybackLoopSyncTests(unittest.TestCase):
             if ready:
                 (root / "new.jpg").write_text("cached ad")
             script += r'''
-PLAYER_VERSION=test EVENT_SLOT=0 blast_idx=0 SCRIPT_DIR=unused
+PLAYER_VERSION=test EVENT_SLOT=0 blast_idx=0 SCRIPT_DIR=unused ID=STATION
 KIOSK_BOOTSTRAPPED=""
 browser_requested() { return 1; }
 checks=0 plays=0

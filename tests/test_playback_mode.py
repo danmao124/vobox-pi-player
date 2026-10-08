@@ -6,7 +6,7 @@ import sys
 import tempfile
 import unittest
 from unittest.mock import patch
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -70,6 +70,23 @@ class PlaybackModeStateTests(unittest.TestCase):
         for contents in ["invalid", "[]", "null"]:
             self.path.write_text(contents)
             self.assertEqual(mode.browser_content(self.path, "STATION"), "")
+
+    def test_station_config_is_normalized_deduplicated_and_bounded(self):
+        self.assertEqual(mode.station_ids(" bay101, MCB, BAY101, ,"), ["BAY101", "MCB"])
+        self.assertEqual(len(mode.station_ids(",".join(str(i) for i in range(16)))), 16)
+        for value in ("", " , ", ",".join(str(i) for i in range(17))):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                mode.station_ids(value)
+        result = subprocess.run([sys.executable, str(ROOT / "playback_mode.py"), "stations", "bay101, MCB,bay101"],
+                                capture_output=True, text=True, check=True)
+        self.assertEqual(result.stdout, "BAY101,MCB\n")
+
+    def test_multiple_panels_require_browser_without_youtube_or_saved_state(self):
+        self.assertEqual(mode.browser_content(self.path, "BAY101,MCB"), "ads")
+        mode.update_state(self.path, "bay101, MCB", 1, response(hasYoutube=False, webContent="other"))
+        self.assertEqual(mode.browser_content(self.path, "BAY101,MCB"), "ads")
+        self.assertEqual(mode.read_state(self.path, "BAY101"), {})
+        self.assertEqual(mode.read_state(self.path, "BAY101,OTHER"), {})
 
     def test_browser_signal_interrupts_image_without_waiting_for_duration(self):
         self.update(1, hasYoutube=False)
@@ -160,6 +177,49 @@ if fetch_batch_to 0 0 "$PENDING_LIST" "$NEXT_FILE" "$NEXT_BLAST_FILE"; then exit
         self.assertEqual(body["playbackMode"], "chromium")
         self.assertEqual(body["playbackSession"], "11111111-1111-4111-8111-111111111111")
         self.assertNotIn("playback", body)
+
+    def test_native_sync_accepts_only_primary_station_or_legacy_commands(self):
+        commands = [{"type": "sync", "data": {"index": i, "timestamp": 100 + i, **tag}}
+                    for i, tag in enumerate(({}, {"adStationId": " station "}, {"adStationId": "OTHER"},
+                                             {"adStationId": ["STATION"]}), 1)]
+        (self.root / "commands.json").write_text(json.dumps(response(data=commands)))
+        output = self.run_shell(r'''
+build_event_body() { echo '{}'; }
+update_playback_mode() { :; }
+curl() { cat "$STATE_DIR/commands.json"; }
+arm_sync_command() { echo "ARM $1"; }
+ask_for_event
+''', names=("ask_for_event",))
+        self.assertEqual([line for line in output.splitlines() if line.startswith("ARM")], ["ARM 1", "ARM 2"])
+
+    def test_multi_station_boot_and_false_signal_keep_browser_panels_running(self):
+        output = self.run_shell(r'''
+ID=BAY101,MCB
+ensure_dirs() { :; }
+start_wifi_hotkey() { :; }
+clear_sync_pending() { :; }
+event_poll_loop() { echo HEARTBEATS; }
+start_mpv_if_needed() { echo WRONG-MPV; exit 99; }
+start_background_fetch_pending() { echo WRONG-PREFETCH; exit 99; }
+wait_while_wizard() { :; }
+chromium_running() { [[ -f "$STATE_DIR/chrome" ]]; }
+kiosk_startx_alive() { chromium_running; }
+x_display_running() { return 1; }
+launch_web_kiosk() { echo "CHROME $1"; touch "$STATE_DIR/chrome"; }
+kill_web_kiosk() { echo WRONG-KILL; exit 99; }
+fetch_batch_to() {
+  [[ -f "$STATE_DIR/chrome" ]] || { echo WRONG-STARTUP-FETCH; exit 99; }
+  printf '{"response":{"success":true,"hasYoutube":false}}' |
+    python3 "$SCRIPT_DIR/playback_mode.py" update "$PLAYBACK_MODE_FILE" "$ID" 2
+}
+sleep() { sync_web_kiosk; echo "STILL $(requested_kiosk_content)"; exit 0; }
+main
+''', names=("main", "requested_kiosk_content", "sync_web_kiosk", "ensure_web_kiosk_healthy"))
+        self.assertEqual(output.count("CHROME ads"), 1)
+        self.assertIn("HEARTBEATS", output)
+        self.assertIn("STILL ads", output)
+        self.assertNotIn("WRONG", output)
+        self.assertEqual((self.root / "ACTIVE_MODE_FILE").read_text(), "chromium\n")
 
     def test_video_wait_and_mpv_start_abort_immediately_for_browser(self):
         self.set_mode(True)
@@ -269,8 +329,8 @@ main
         self.assertIn("RESTART: daily browser refresh with a new playback session", output)
         self.assertNotIn("MPV", output)
 
-    def test_kiosk_url_credentials_autoplay_and_rotation(self):
-        output = self.run_shell(r'''
+    def check_kiosk_launch(self, stations):
+        output = self.run_shell(f"ID={shlex.quote(stations)}\n" + r'''
 ORIENTATION=90
 rm() { :; }
 chromium_running() { [[ -f "$STATE_DIR/launched" ]]; }
@@ -290,7 +350,7 @@ wait
         args = (self.root / "args").read_text().splitlines()
         url = next(arg for arg in args if arg.startswith("https://"))
         parts = urlsplit(url)
-        self.assertEqual(parts.path, "/ads/STATION")
+        self.assertEqual(unquote(parts.path), "/ads/" + stations)
         self.assertEqual(parse_qs(parts.query), {
             "kiosk": ["1"], "deviceId": ["device-test"], "secret": ["secret-test"],
             "playbackSession": ["11111111-1111-4111-8111-111111111111"],
@@ -299,6 +359,12 @@ wait
         self.assertEqual((self.root / "rotation").read_text().strip(), "--output HDMI-1 --rotate right")
         self.assertNotIn("secret-test", output)
         self.assertNotIn("https://", output)
+
+    def test_kiosk_url_credentials_autoplay_and_rotation(self):
+        self.check_kiosk_launch("STATION")
+
+    def test_multi_station_kiosk_url_has_all_panels_in_one_session(self):
+        self.check_kiosk_launch("BAY101,MCB")
 
 
 if __name__ == "__main__":

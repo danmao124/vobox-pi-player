@@ -9,10 +9,18 @@ import tempfile
 import time
 
 
+def station_ids(value):
+    """Normalize the ordered station list in config.env's ID setting."""
+    stations = list(dict.fromkeys(part.strip().upper() for part in value.split(",") if part.strip()))
+    if not 1 <= len(stations) <= 16:
+        raise ValueError("ID must contain between 1 and 16 distinct comma-separated ad stations")
+    return stations
+
+
 def read_state(path, station):
     try:
         state = json.loads(Path(path).read_text())
-        if isinstance(state, dict) and state.get("stationId") == station.strip().upper():
+        if isinstance(state, dict) and state.get("stationId") == ",".join(station_ids(station)):
             return state
     except (OSError, ValueError):
         pass
@@ -20,6 +28,9 @@ def read_state(path, station):
 
 
 def browser_content(path, station):
+    # mpv owns one full-screen asset; independent station panels require Chromium.
+    if len(station_ids(station)) > 1:
+        return "ads"
     state = read_state(path, station)
     if state.get("hasYoutube") is True:
         return "ads"
@@ -44,7 +55,7 @@ def update_state(path, station, requested_at, payload):
     with open(str(path) + ".lock", "a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         state = read_state(path, station)
-        state["stationId"] = station.strip().upper()
+        state["stationId"] = ",".join(station_ids(station))
         versions = state.setdefault("requestedAt", {})
         for key, value in updates.items():
             # A slow prefetch must not undo a newer heartbeat (or vice versa).
@@ -66,6 +77,8 @@ if __name__ == "__main__":
     action, *args = sys.argv[1:]
     if action == "clock":
         print(time.monotonic_ns())
+    elif action == "stations":
+        print(",".join(station_ids(args[0])))
     elif action == "update":
         path, station, requested_at = args
         update_state(path, station, int(requested_at), json.load(sys.stdin))
