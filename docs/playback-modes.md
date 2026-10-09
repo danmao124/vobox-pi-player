@@ -1,6 +1,6 @@
 # Native and Chromium playback
 
-Release `2026.10.08.3` reads the boolean `response.hasYoutube` from successful
+Release `2026.10.08.4` reads the boolean `response.hasYoutube` from successful
 `view/billboard` and `device/askforevent` responses. The backend evaluates the
 whole currently eligible station playlist, including applicable default/blast
 items, rather than only the returned batch.
@@ -33,6 +33,15 @@ is trimmed and matched case-insensitively against `ID`. Blank, omitted, or
 unmatched values omit `unmute` entirely, keeping all Chromium ad panels muted.
 Set only one station ID. Restart the player service after changing the config.
 This setting controls the `/ads` browser page; mpv audio behavior is unchanged.
+
+Chromium ad pages receive `orientation=0|90|180|270` from `ORIENTATION` in
+`/data/player/config.env` (clockwise degrees). Missing, blank, or invalid browser
+orientation values default to `0`. For example, adding `ORIENTATION=90` to the
+config above sends both `unmute=BABY` and `orientation=90`, along with the kiosk
+authentication parameters. The website rotates the entire station layout together
+and swaps its layout width/height at 90/270 degrees. Restart the service after
+changing orientation; startup, renderer changes, recovery, and daily refresh all
+use the same launch URL builder.
 
 The native heartbeat runs immediately after startup and then once per minute in
 the device's existing slot. It continues while Chromium is active. Browser mode
@@ -85,9 +94,13 @@ of frame-accurate decoding or YouTube network startup.
 Deploy the backend and website protocol support before enabling this player
 release. Deploy `tvads.sh`, `playback_report.py`, and `playback_mode.py` together
 and restart the player service. The existing service must restart on exit and
-terminate its entire control group. Chromium, `startx`, and `xset` are required;
-rotated ad displays also require `xrandr`. The player rotates `/ads` through X;
-existing `/player/:orientation/:command` pages retain their own CSS rotation.
+terminate its entire control group. Chromium, `startx`, and `xset` are required.
+Deploy the website's `/ads?orientation=` support before this player release.
+The player no longer rotates `/ads` through `xrandr`; both ad pages and existing
+`/player/:orientation/:command` pages rotate in the website. Keep the X/display
+configuration unrotated to avoid applying the same rotation twice. Native mpv
+still uses `--video-rotate`, and the Wi-Fi wizard still rotates its text console
+through fbcon. Neither of those paths changes.
 
 Run `python3 -m unittest discover -s tests` and `bash -n tvads.sh` locally. Tests
 use stubbed renderers, HTTP, and network commands. Before fleet rollout, check two

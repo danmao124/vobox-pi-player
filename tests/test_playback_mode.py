@@ -329,42 +329,94 @@ main
         self.assertIn("RESTART: daily browser refresh with a new playback session", output)
         self.assertNotIn("MPV", output)
 
-    def check_kiosk_launch(self, stations):
-        output = self.run_shell(f"ID={shlex.quote(stations)}\n" + r'''
-ORIENTATION=90
+    def launch_kiosk(self, stations="STATION", orientation="90", *, unmuted_id=None,
+                     content="ads", secret="secret-test", supervised=False):
+        for name in ("launched", "args", "rotation", "xset-args"):
+            (self.root / name).unlink(missing_ok=True)
+        settings = {"ID": stations, "ORIENTATION": orientation, "UNMUTED_ID": unmuted_id,
+                    "WEB_STATION": "WEB-STATION", "DEVICE_SECRET": secret}
+        config = "\n".join(f"unset {key}" if value is None else f"{key}={shlex.quote(value)}"
+                           for key, value in settings.items()) + "\n"
+        command = "sync_web_kiosk" if supervised else "launch_web_kiosk " + shlex.quote(content)
+        output = self.run_shell(config + r'''
 rm() { :; }
 chromium_running() { [[ -f "$STATE_DIR/launched" ]]; }
 kiosk_startx_alive() { [[ -n "$CHROMIUM_PID" ]]; }
 x_display_running() { return 1; }
 kill_web_kiosk() { exit 99; }
 startx() { printf '%s\n' "$@" > "$STATE_DIR/args"; touch "$STATE_DIR/launched"; }
-xset() { :; }
-xrandr() {
-  if [[ "$1" == "--query" ]]; then echo 'HDMI-1 connected primary';
-  else printf '%s\n' "$*" > "$STATE_DIR/rotation"; fi
-}
+xset() { printf '%s\n' "$*" >> "$STATE_DIR/xset-args"; }
+xrandr() { printf '%s\n' "$*" >> "$STATE_DIR/rotation"; }
 # Use real sleep while the harmless startx stub writes its marker.
-launch_web_kiosk ads
-wait
-''', names=("launch_web_kiosk",))
+''' + command + "\nwait\n", names=("launch_web_kiosk", "sync_web_kiosk",
+                                          "ensure_web_kiosk_healthy", "requested_kiosk_content"))
         args = (self.root / "args").read_text().splitlines()
         url = next(arg for arg in args if arg.startswith("https://"))
         parts = urlsplit(url)
-        self.assertEqual(unquote(parts.path), "/ads/" + stations)
-        self.assertEqual(parse_qs(parts.query), {
-            "kiosk": ["1"], "deviceId": ["device-test"], "secret": ["secret-test"],
-            "playbackSession": ["11111111-1111-4111-8111-111111111111"],
-        })
-        self.assertIn("--autoplay-policy=no-user-gesture-required", args)
-        self.assertEqual((self.root / "rotation").read_text().strip(), "--output HDMI-1 --rotate right")
-        self.assertNotIn("secret-test", output)
+        self.assertEqual(parts.scheme, "https")
+        self.assertEqual(parts.netloc, "example.test")
+        self.assertEqual(parts.fragment, "")
+        self.assertEqual(args[0], "/usr/bin/chromium")
+        for flag in ("--kiosk", "--start-fullscreen", "--window-position=0,0",
+                     "--window-size=1920,1080", "--force-device-scale-factor=1",
+                     "--disable-dev-shm-usage", "--autoplay-policy=no-user-gesture-required"):
+            self.assertIn(flag, args)
+        self.assertEqual(args[-5:], ["--", ":0", "-nocursor", "-s", "off"])
+        self.assertEqual((self.root / "xset-args").read_text().splitlines(),
+                         ["q", "s off", "s noblank", "-dpms", "dpms 0 0 0"])
+        self.assertFalse((self.root / "rotation").exists(), "Website rotation must not also rotate X")
+        self.assertNotIn(secret, output)
         self.assertNotIn("https://", output)
+        return parts
 
-    def test_kiosk_url_credentials_autoplay_and_rotation(self):
-        self.check_kiosk_launch("STATION")
+    def assert_ads_url(self, parts, stations, orientation, *, unmute=None, secret="secret-test"):
+        self.assertEqual(unquote(parts.path), "/ads/" + stations)
+        expected = {
+            "kiosk": ["1"], "deviceId": ["device-test"], "secret": [secret],
+            "playbackSession": ["11111111-1111-4111-8111-111111111111"],
+            "orientation": [orientation],
+        }
+        if unmute is not None:
+            expected["unmute"] = [unmute]
+        self.assertEqual(parse_qs(parts.query, keep_blank_values=True), expected)
 
-    def test_multi_station_kiosk_url_has_all_panels_in_one_session(self):
-        self.check_kiosk_launch("BAY101,MCB")
+    def test_ads_orientation_preserves_stations_unmute_and_kiosk_credentials(self):
+        for stations, unmuted_id, unmute in (("STATION", " station ", "STATION"),
+                                            ("BABY,PEPE", " baby ", "BABY")):
+            for angle in ("0", "90", "180", "270"):
+                with self.subTest(stations=stations, angle=angle):
+                    parts = self.launch_kiosk(stations, angle, unmuted_id=unmuted_id)
+                    self.assert_ads_url(parts, stations, angle, unmute=unmute)
+
+    def test_missing_blank_or_invalid_browser_orientation_defaults_to_zero(self):
+        for orientation in (None, "", "45", "-90", "360", "90.0", "invalid", "90&unmute=PEPE"):
+            with self.subTest(orientation=orientation):
+                parts = self.launch_kiosk("BABY,PEPE", orientation, unmuted_id="baby")
+                self.assert_ads_url(parts, "BABY,PEPE", "0", unmute="BABY")
+
+    def test_orientation_preserves_muted_defaults_and_query_encoding(self):
+        secret = "secret&+=?# /%"
+        for unmuted_id in (None, "", "  ", "OTHER", "BABY,PEPE"):
+            with self.subTest(unmuted_id=unmuted_id):
+                parts = self.launch_kiosk("BABY,PEPE", "270", unmuted_id=unmuted_id, secret=secret)
+                self.assert_ads_url(parts, "BABY,PEPE", "270", secret=secret)
+
+    def test_supervisor_uses_current_orientation_for_single_and_multiple_stations(self):
+        self.set_mode(True)
+        for stations in ("STATION", "BABY,PEPE"):
+            for angle in ("90", "270"):
+                with self.subTest(stations=stations, angle=angle):
+                    # Each process re-reads config on startup/recovery/reconfiguration.
+                    parts = self.launch_kiosk(stations, angle, supervised=True)
+                    self.assert_ads_url(parts, stations, angle)
+                    self.assertEqual((self.root / "ACTIVE_MODE_FILE").read_text(), "chromium\n")
+
+    def test_scheduled_web_pages_keep_orientation_path_and_rotate_only_in_website(self):
+        for angle in ("0", "90", "180", "270"):
+            with self.subTest(angle=angle):
+                parts = self.launch_kiosk(orientation=angle, content="bay101poker")
+                self.assertEqual(parts.path, f"/player/{angle}/bay101poker")
+                self.assertEqual(parse_qs(parts.query), {"id": ["WEB-STATION"], "secret": ["secret-test"]})
 
 
 if __name__ == "__main__":

@@ -3,7 +3,7 @@ set -euo pipefail
 
 # Bump for each player release, including changes to playback_report.py.
 # Captured by the running process; updating files takes effect after restart.
-readonly PLAYER_VERSION="2026.10.08.3"
+readonly PLAYER_VERSION="2026.10.08.4"
 
 CONFIG="/data/player/config.env"
 STATE_DIR="/tmp/player/state"
@@ -1161,27 +1161,25 @@ kiosk_startx_alive() {
 
 launch_web_kiosk() {
   local web_content="$1"
-  local api_host kiosk_url rotate="normal"
+  local api_host kiosk_url orientation="${ORIENTATION:-0}"
+  case "$orientation" in
+    0|90|180|270) ;;
+    *) orientation=0 ;;
+  esac
   api_host="$(echo "$API_BASE" | sed -E 's|^https?://||; s|/.*||')"
   if [[ "$web_content" == "ads" ]]; then
     local kiosk_query
     kiosk_query="$(jq -rn --arg deviceId "$DEVICE_ID" --arg secret "$DEVICE_SECRET" \
       --arg playbackSession "$PLAYBACK_SESSION" --arg stations "$ID" --arg unmutedId "${UNMUTED_ID:-}" \
+      --arg orientation "$orientation" \
       '($unmutedId | ascii_upcase | gsub("^\\s+|\\s+$"; "")) as $unmute
-       | {kiosk:"1",deviceId:$deviceId,secret:$secret,playbackSession:$playbackSession}
+       | {kiosk:"1",deviceId:$deviceId,secret:$secret,playbackSession:$playbackSession,orientation:$orientation}
        + (if $unmute != "" and (($stations | split(",") | index($unmute)) != null)
           then {unmute:$unmute} else {} end)
        | to_entries | map((.key | @uri) + "=" + (.value | @uri)) | join("&")')"
     kiosk_url="https://${api_host}/ads/$(jq -rn --arg id "$ID" '$id | @uri')?${kiosk_query}"
-    # /ads handles the complete mixed playlist. Rotate the display because this
-    # route has no CSS rotation; the existing /player routes rotate themselves.
-    case "$ORIENTATION" in
-      90) rotate="right" ;;
-      180) rotate="inverted" ;;
-      270) rotate="left" ;;
-    esac
   else
-    kiosk_url="https://${api_host}/player/${ORIENTATION}/${web_content}?id=${WEB_STATION}&secret=${DEVICE_SECRET}"
+    kiosk_url="https://${api_host}/player/${orientation}/${web_content}?id=${WEB_STATION}&secret=${DEVICE_SECRET}"
   fi
 
   if kiosk_startx_alive && chromium_running; then
@@ -1199,7 +1197,7 @@ launch_web_kiosk() {
     sleep 1
   fi
 
-  log "Launching Chromium kiosk (content=${web_content}, rotation=${ORIENTATION}°)"
+  log "Launching Chromium kiosk (content=${web_content}, rotation=${orientation}°)"
 
   rm -rf ~/.cache/chromium ~/.config/chromium
 
@@ -1222,18 +1220,12 @@ launch_web_kiosk() {
 
   # Wait for X to accept connections, then disable blanking/DPMS.
   # (Immediate xset after startx races and silently fails.)
+  # Both /ads and /player rotate in the website; rotating X would apply it twice.
   (
     export DISPLAY=:0
     export XAUTHORITY="${XAUTHORITY:-$HOME/.Xauthority}"
     for _ in {1..50}; do
       if xset q >/dev/null 2>&1; then
-        if [[ "$rotate" != "normal" ]]; then
-          local output
-          output="$(xrandr --query | awk '$2 == "connected" {print $1; exit}' || true)"
-          if [[ -z "$output" ]] || ! xrandr --output "$output" --rotate "$rotate"; then
-            log "WARN: could not rotate Chromium display to ${ORIENTATION}°"
-          fi
-        fi
         xset s off
         xset s noblank
         xset -dpms
