@@ -330,16 +330,20 @@ main
         self.assertNotIn("MPV", output)
 
     def launch_kiosk(self, stations="STATION", orientation="90", *, unmuted_id=None,
-                     content="ads", secret="secret-test", supervised=False):
+                     content="ads", secret="secret-test", supervised=False,
+                     kms_output="", kms_status=0, expected_size="1920,1080"):
         for name in ("launched", "args", "rotation", "xset-args"):
             (self.root / name).unlink(missing_ok=True)
+        (self.root / "kms-output").write_text(kms_output)
         settings = {"ID": stations, "ORIENTATION": orientation, "UNMUTED_ID": unmuted_id,
-                    "WEB_STATION": "WEB-STATION", "DEVICE_SECRET": secret}
+                    "WEB_STATION": "WEB-STATION", "DEVICE_SECRET": secret,
+                    "KMS_STATUS": str(kms_status)}
         config = "\n".join(f"unset {key}" if value is None else f"{key}={shlex.quote(value)}"
                            for key, value in settings.items()) + "\n"
         command = "sync_web_kiosk" if supervised else "launch_web_kiosk " + shlex.quote(content)
         output = self.run_shell(config + r'''
 rm() { :; }
+kmsprint() { cat "$STATE_DIR/kms-output"; return "$KMS_STATUS"; }
 chromium_running() { [[ -f "$STATE_DIR/launched" ]]; }
 kiosk_startx_alive() { [[ -n "$CHROMIUM_PID" ]]; }
 x_display_running() { return 1; }
@@ -348,7 +352,7 @@ startx() { printf '%s\n' "$@" > "$STATE_DIR/args"; touch "$STATE_DIR/launched"; 
 xset() { printf '%s\n' "$*" >> "$STATE_DIR/xset-args"; }
 xrandr() { printf '%s\n' "$*" >> "$STATE_DIR/rotation"; }
 # Use real sleep while the harmless startx stub writes its marker.
-''' + command + "\nwait\n", names=("launch_web_kiosk", "sync_web_kiosk",
+''' + command + "\nwait\n", names=("kms_window_size", "launch_web_kiosk", "sync_web_kiosk",
                                           "ensure_web_kiosk_healthy", "requested_kiosk_content"))
         args = (self.root / "args").read_text().splitlines()
         url = next(arg for arg in args if arg.startswith("https://"))
@@ -358,7 +362,7 @@ xrandr() { printf '%s\n' "$*" >> "$STATE_DIR/rotation"; }
         self.assertEqual(parts.fragment, "")
         self.assertEqual(args[0], "/usr/bin/chromium")
         for flag in ("--kiosk", "--start-fullscreen", "--window-position=0,0",
-                     "--window-size=1920,1080", "--force-device-scale-factor=1",
+                     f"--window-size={expected_size}", "--force-device-scale-factor=1",
                      "--disable-dev-shm-usage", "--autoplay-policy=no-user-gesture-required"):
             self.assertIn(flag, args)
         self.assertEqual(args[-5:], ["--", ":0", "-nocursor", "-s", "off"])
@@ -367,7 +371,63 @@ xrandr() { printf '%s\n' "$*" >> "$STATE_DIR/rotation"; }
         self.assertFalse((self.root / "rotation").exists(), "Website rotation must not also rotate X")
         self.assertNotIn(secret, output)
         self.assertNotIn("https://", output)
+        if kms_status == 0 and kms_output and expected_size != "1920,1080":
+            self.assertIn("Chromium window size from kmsprint: " + expected_size.replace(",", "x"), output)
+        elif kms_status != 0 or not kms_output:
+            self.assertIn("WARN: no active resolution from kmsprint; using Chromium window size 1920x1080", output)
         return parts
+
+    def test_kiosk_uses_active_4k_mode_instead_of_scaled_framebuffer(self):
+        kms_output = """Connector 0 (32) HDMI-A-1 (connected)
+  Encoder 0 (31) TMDS
+    Crtc 3 (96) 3840x2160@60.00 594.000 3840/176/88/296/+ 2160/8/10/72/+ 60 (60.00)
+      Plane 3 (86) fb-id: 340 (crtcs: 3) 0,0 1920x1080 -> 0,0 3840x2160
+        FB 340 1920x1080 RG16
+"""
+        for content, orientation in (("ads", "0"), ("ads", "90"), ("bay101poker", "270")):
+            with self.subTest(content=content, orientation=orientation):
+                self.launch_kiosk(content=content, orientation=orientation, kms_output=kms_output,
+                                  expected_size="3840,2160")
+
+    def test_kiosk_skips_disconnected_and_inactive_outputs_and_keeps_first_active(self):
+        self.launch_kiosk(kms_output="""Connector 0 (32) HDMI-A-1 (disconnected)
+  Encoder 0 (31) TMDS
+    Crtc 0 (96) 3840x2160@60.00
+Connector 1 (42) HDMI-A-2 (connected)
+  Encoder 1 (41) TMDS
+    Crtc 1 (97)
+      Plane 1 (87) fb-id: 341 (crtcs: 1) 0,0 3840x2160 -> 0,0 3840x2160
+        FB 341 3840x2160 RG16
+Connector 2 (52) DSI-1 (connected)
+  Encoder 2 (51) DSI
+    Crtc 2 (98) 1280x720 74.250 1280/110/40/220/+ 720/5/5/20/+ 60 (60.00)
+Connector 3 (62) DSI-2 (connected)
+  Encoder 3 (61) DSI
+    Crtc 3 (99) 1920x1080@60.00
+""", expected_size="1280,720")
+
+    def test_kiosk_resolution_fallback_is_always_1080p(self):
+        for kms_output, status in (
+            ("", 0),
+            ("unrecognized output", 0),
+            ("Connector 0 (32) HDMI-A-1 (connected)\n    Crtc 0 (96) 0x0@60.00\n", 0),
+            ("Connector 0 (32) HDMI-A-1 (connected)\n    0 3840x2160@60.00\n", 0),
+            ("Connector 0 (32) HDMI-A-1 (connected)\n    Crtc 0 (96) 3840x2160@60.00\n", 1),
+            ("", 127),
+        ):
+            with self.subTest(kms_output=kms_output, status=status):
+                self.launch_kiosk(kms_output=kms_output, kms_status=status)
+
+    def test_kms_resolution_detection_handles_missing_command(self):
+        output = self.run_shell(r'''
+command() {
+  if [[ "$*" == "-v kmsprint" ]]; then return 1; fi
+  builtin command "$@"
+}
+if kms_window_size; then exit 99; fi
+echo NO-KMS
+''', names=("kms_window_size",))
+        self.assertEqual(output, "NO-KMS\n")
 
     def assert_ads_url(self, parts, stations, orientation, *, unmute=None, secret="secret-test"):
         self.assertEqual(unquote(parts.path), "/ads/" + stations)

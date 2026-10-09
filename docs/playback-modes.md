@@ -1,6 +1,6 @@
 # Native and Chromium playback
 
-Release `2026.10.08.4` reads the boolean `response.hasYoutube` from successful
+Release `2026.10.08.5` reads the boolean `response.hasYoutube` from successful
 `view/billboard` and `device/askforevent` responses. The backend evaluates the
 whole currently eligible station playlist, including applicable default/blast
 items, rather than only the returned batch.
@@ -42,6 +42,16 @@ authentication parameters. The website rotates the entire station layout togethe
 and swaps its layout width/height at 90/270 degrees. Restart the service after
 changing orientation; startup, renderer changes, recovery, and daily refresh all
 use the same launch URL builder.
+
+Before each Chromium launch, the player reads the first connected output with an
+active CRTC mode from `kmsprint` and uses its width/height for `--window-size`
+(for example, `3840,2160` for a 4K output). It checks other DRM cards if the default
+card has no usable mode. Missing/failed `kmsprint` or no active mode falls back
+to `1920,1080` with a warning. The selected size is logged. This samples the mode
+before X starts; it does not change the HDMI mode or refresh rate. Orientation
+still happens in the website, so the window dimensions are not swapped.
+Install `kms++-utils` if `kmsprint` is missing. After deploying, restart the player
+with the TV connected and check the `Chromium window size from kmsprint` log line.
 
 The native heartbeat runs immediately after startup and then once per minute in
 the device's existing slot. It continues while Chromium is active. Browser mode

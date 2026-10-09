@@ -3,7 +3,7 @@ set -euo pipefail
 
 # Bump for each player release, including changes to playback_report.py.
 # Captured by the running process; updating files takes effect after restart.
-readonly PLAYER_VERSION="2026.10.08.4"
+readonly PLAYER_VERSION="2026.10.08.5"
 
 CONFIG="/data/player/config.env"
 STATE_DIR="/tmp/player/state"
@@ -1159,9 +1159,39 @@ kiosk_startx_alive() {
   [[ -n "${CHROMIUM_PID:-}" ]] && kill -0 "$CHROMIUM_PID" 2>/dev/null
 }
 
+kms_window_size() {
+  local device kms_state window_size
+  command -v kmsprint >/dev/null 2>&1 || return 1
+
+  # Try the default card first; Pi DRM card numbering can vary between boots.
+  for device in "" /dev/dri/card[0-9]*; do
+    if [[ -z "$device" ]]; then
+      kms_state="$(LC_ALL=C kmsprint 2>/dev/null)" || continue
+    else
+      [[ -e "$device" ]] || continue
+      kms_state="$(LC_ALL=C kmsprint --device="$device" 2>/dev/null)" || continue
+    fi
+    # Read the first connected output's active CRTC, not a plane/framebuffer
+    # size (which can be scaled) or the supported modes from kmsprint -m.
+    window_size="$(awk '
+      $1 == "Connector" { connected = ($5 == "(connected)") }
+      connected && $1 == "Crtc" && $4 ~ /^[1-9][0-9]*x[1-9][0-9]*(@[0-9.]+)?$/ {
+        split($4, dimensions, /[x@]/)
+        print dimensions[1] "," dimensions[2]
+        exit
+      }
+    ' <<< "$kms_state")"
+    if [[ -n "$window_size" ]]; then
+      printf '%s\n' "$window_size"
+      return 0
+    fi
+  done
+  return 1
+}
+
 launch_web_kiosk() {
   local web_content="$1"
-  local api_host kiosk_url orientation="${ORIENTATION:-0}"
+  local api_host kiosk_url window_size orientation="${ORIENTATION:-0}"
   case "$orientation" in
     0|90|180|270) ;;
     *) orientation=0 ;;
@@ -1197,7 +1227,13 @@ launch_web_kiosk() {
     sleep 1
   fi
 
-  log "Launching Chromium kiosk (content=${web_content}, rotation=${orientation}°)"
+  if window_size="$(kms_window_size)"; then
+    log "Chromium window size from kmsprint: ${window_size/,/x}"
+  else
+    window_size="1920,1080"
+    log "WARN: no active resolution from kmsprint; using Chromium window size 1920x1080"
+  fi
+  log "Launching Chromium kiosk (content=${web_content}, rotation=${orientation}°, window=${window_size/,/x})"
 
   rm -rf ~/.cache/chromium ~/.config/chromium
 
@@ -1206,7 +1242,7 @@ launch_web_kiosk() {
     --kiosk \
     --start-fullscreen \
     --window-position=0,0 \
-    --window-size=1920,1080 \
+    --window-size="$window_size" \
     --force-device-scale-factor=1 \
     --noerrdialogs \
     --no-first-run \
