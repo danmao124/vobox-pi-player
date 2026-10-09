@@ -434,7 +434,7 @@ echo NO-KMS
         expected = {
             "kiosk": ["1"], "deviceId": ["device-test"], "secret": [secret],
             "playbackSession": ["11111111-1111-4111-8111-111111111111"],
-            "orientation": [orientation],
+            "orientation": [orientation], "index": ["-2"],
         }
         if unmute is not None:
             expected["unmute"] = [unmute]

@@ -3,7 +3,7 @@ set -euo pipefail
 
 # Bump for each player release, including changes to playback_report.py.
 # Captured by the running process; updating files takes effect after restart.
-readonly PLAYER_VERSION="2026.10.08.5"
+readonly PLAYER_VERSION="2026.10.09.1"
 
 CONFIG="/data/player/config.env"
 STATE_DIR="/tmp/player/state"
@@ -1203,7 +1203,7 @@ launch_web_kiosk() {
       --arg playbackSession "$PLAYBACK_SESSION" --arg stations "$ID" --arg unmutedId "${UNMUTED_ID:-}" \
       --arg orientation "$orientation" \
       '($unmutedId | ascii_upcase | gsub("^\\s+|\\s+$"; "")) as $unmute
-       | {kiosk:"1",deviceId:$deviceId,secret:$secret,playbackSession:$playbackSession,orientation:$orientation}
+       | {kiosk:"1",deviceId:$deviceId,secret:$secret,playbackSession:$playbackSession,orientation:$orientation,index:"-2"}
        + (if $unmute != "" and (($stations | split(",") | index($unmute)) != null)
           then {unmute:$unmute} else {} end)
        | to_entries | map((.key | @uri) + "=" + (.value | @uri)) | join("&")')"

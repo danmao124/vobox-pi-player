@@ -1,6 +1,6 @@
 # Native and Chromium playback
 
-Release `2026.10.08.5` reads the boolean `response.hasYoutube` from successful
+Release `2026.10.09.1` reads the boolean `response.hasYoutube` from successful
 `view/billboard` and `device/askforevent` responses. The backend evaluates the
 whole currently eligible station playlist, including applicable default/blast
 items, rather than only the returned batch.
@@ -33,6 +33,10 @@ is trimmed and matched case-insensitively against `ID`. Blank, omitted, or
 unmatched values omit `unmute` entirely, keeping all Chromium ad panels muted.
 Set only one station ID. Restart the player service after changing the config.
 This setting controls the `/ads` browser page; mpv audio behavior is unchanged.
+
+Every Chromium ad launch includes `index=-2`, for both single- and multi-station
+layouts. The shared index applies to every ad panel. Web-station launch URLs
+do not receive this parameter. Deploy the website URL-index support first.
 
 Chromium ad pages receive `orientation=0|90|180|270` from `ORIENTATION` in
 `/data/player/config.env` (clockwise degrees). Missing, blank, or invalid browser
