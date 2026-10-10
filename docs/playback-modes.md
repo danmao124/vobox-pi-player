@@ -16,8 +16,100 @@ To play multiple independent station panels, set the comma-separated `ID` in
 The player trims whitespace, uppercases IDs, removes duplicates, and accepts up
 to 16 distinct stations. Multiple stations always use Chromium, including when
 `hasYoutube` is false, so all panels remain visible. Removing a station from the
-configuration takes effect on restart. A single remaining station resumes the
-normal YouTube-based renderer selection.
+configuration takes effect on restart. Without an explicit `LAYOUT`, a single
+remaining station resumes the normal YouTube-based renderer selection.
+
+## Optional screen layout
+
+Release `2026.10.10.1` adds `LAYOUT` in `/data/player/config.env`. See
+[`config.env.example`](../config.env.example) for a complete example. For three
+authorized stations:
+
+```sh
+ID='A,B,C'
+LAYOUT='A:70 | (B / C):30'
+```
+
+This gives A the left 70% of the screen and divides the right 30% equally between
+B above C. `|` means side by side, `/` means top to bottom, and parentheses group
+a section. Splits default to equal sizes. Weights are relative, so `A:2 | B`
+means two-thirds/one-third. Other examples for `ID='A,B,C'`:
+
+```sh
+LAYOUT='A | (B / C)'
+LAYOUT='(A | B) / C'
+```
+
+Use parentheses when mixing the two operators: `A | B / C` is rejected as
+ambiguous. Positive decimal weights may be at most 1000000. Readable expressions
+may contain at most 2048 characters, 16 panels and 16 nesting levels. Coordinates
+are rounded to six decimal places; weights so small that a panel rounds to zero
+are rejected. IDs containing shorthand punctuation can use encoded JSON instead.
+
+Every configured station must appear exactly once. IDs are matched
+case-insensitively and normalized to uppercase. Layout panel order controls
+geometry/layering; `ID` continues to control authorization, the primary station,
+and URL path order. The existing shared `index=-2` remains separate and applies to
+every panel. A layout never adds or removes authorized stations.
+
+**Repeated stations are unsupported in authenticated Pi kiosks.** For example,
+`ID='BABY,PEPE'` with `LAYOUT='(BABY | PEPE) / PEPE'` fails validation, even though
+the same composition works on a public website link. Two panels for one kiosk
+station/session would send competing playback reports. Enabling that requires
+separate website/reporting work; the player does not drop copies or bypass kiosk
+authentication.
+
+An explicit layout selects Chromium even for a single station with no YouTube
+items, and takes precedence over a web-station schedule, like multi-station mode.
+Omitting `LAYOUT`, setting `LAYOUT=''`, or supplying only whitespace preserves the
+existing layout and renderer selection. Restart the service after editing config;
+there is no hot reload. Startup, recovery and daily refresh re-read and validate
+the config in a fresh process with a new playback session. Invalid layouts stop
+startup with an `ERROR: invalid LAYOUT in config.env` diagnostic instead of showing
+a different layout. Restarting with blank `LAYOUT` restores the previous behavior.
+
+Layout values are parsed as data, never evaluated as commands. The config file
+itself follows the existing trusted Bash `source` convention: use single quotes
+as above, especially around values containing shell punctuation. Do not put shell
+commands or command substitutions in config values.
+
+For gaps, overlaps, or per-panel fit, use `LAYOUT='base64url:ENCODED_VALUE'`, where
+`ENCODED_VALUE` is unpadded base64url of UTF-8 JSON with this exact v1 schema:
+
+```json
+{"v":1,"panels":[{"station":"A","x":0,"y":0,"w":70,"h":100},{"station":"B","x":70,"y":0,"w":30,"h":50},{"station":"C","x":70,"y":50,"w":30,"h":50}]}
+```
+
+For example, save your JSON to `layout.json` and generate the config line with
+Python's standard library:
+
+```sh
+python3 - <<'PY'
+import base64
+from pathlib import Path
+encoded = base64.urlsafe_b64encode(Path('layout.json').read_bytes()).decode().rstrip('=')
+print("LAYOUT='base64url:" + encoded + "'")
+PY
+```
+
+Rectangles use screen percentages measured from the top left **before** whole-screen
+rotation. Width/height must be positive and rectangles must stay within 0–100%.
+Later panels draw over earlier ones; uncovered space is black. A panel may add
+`"fit":"contain"`, `"cover"`, or `"stretch"`. Explicit layouts default to `contain`.
+Unknown fields/versions, invalid rectangles, station mismatches, repeated stations,
+and encoded payloads over 8192 characters are rejected. The `base64url:` prefix is
+only a config marker; the player validates and sends just the encoded JSON as one
+URL `layout` parameter. The proposed `s1:` URL syntax is not supported.
+
+The deployable helper `ad_layout.py` uses only Python's standard library and the
+existing `playback_mode.py`; it does not need Node.js or a website checkout. To
+validate a literal value locally without launching a renderer, feed it on stdin:
+
+```sh
+printf '%s' 'A:70 | (B / C):30' | python3 ad_layout.py 'A,B,C'
+```
+
+## Audio, rotation and browser operation
 
 To enable Chromium audio for one station, set `UNMUTED_ID` in the same config:
 
@@ -106,10 +198,11 @@ of frame-accurate decoding or YouTube network startup.
 ## Deployment and verification
 
 Deploy the backend and website protocol support before enabling this player
-release. Deploy `tvads.sh`, `playback_report.py`, and `playback_mode.py` together
+release. Deploy `tvads.sh`, `playback_report.py`, `playback_mode.py`, and `ad_layout.py` together
 and restart the player service. The existing service must restart on exit and
 terminate its entire control group. Chromium, `startx`, and `xset` are required.
-Deploy the website's `/ads?orientation=` support before this player release.
+Deploy the website's `/ads?orientation=` support before this player release, and
+its v1 `/ads?layout=` support before configuring a nonempty `LAYOUT`.
 The player no longer rotates `/ads` through `xrandr`; both ad pages and existing
 `/player/:orientation/:command` pages rotate in the website. Keep the X/display
 configuration unrotated to avoid applying the same rotation twice. Native mpv

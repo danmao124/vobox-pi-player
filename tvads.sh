@@ -3,7 +3,7 @@ set -euo pipefail
 
 # Bump for each player release, including changes to playback_report.py.
 # Captured by the running process; updating files takes effect after restart.
-readonly PLAYER_VERSION="2026.10.09.1"
+readonly PLAYER_VERSION="2026.10.10.1"
 
 CONFIG="/data/player/config.env"
 STATE_DIR="/tmp/player/state"
@@ -84,7 +84,7 @@ source "$CONFIG"
 
 : "${API_BASE:?Missing API_BASE in config.env}"
 : "${ID:?Missing ID in config.env}"
-# One station retains native playback; a comma-separated list opens independent browser panels.
+# Without LAYOUT, one station retains native playback; a list opens browser panels.
 ID="$(python3 "$SCRIPT_DIR/playback_mode.py" stations "$ID")"
 
 IMAGE_SECONDS="${IMAGE_SECONDS:-15}"
@@ -92,6 +92,11 @@ MAX_CACHE_MB="${MAX_CACHE_MB:-30000}" # Trim above this limit to 90%; keep activ
 ORIENTATION="${ORIENTATION:-0}"  # Screen orientation: 0, 90, 180, or 270
 WEB_STATION="${WEB_STATION:-}"  # Optional web station id
 UNMUTED_ID="${UNMUTED_ID:-}"  # Optional ad station to unmute in Chromium; blank keeps all muted.
+LAYOUT="${LAYOUT:-}"  # Optional split expression or base64url: payload; see docs/playback-modes.md.
+# Validate once per process, before auth/network/renderer startup. Config reloads
+# still use a full service restart, with fresh one-use browser credentials.
+LAYOUT_ENCODED="$(printf '%s' "$LAYOUT" | python3 "$SCRIPT_DIR/ad_layout.py" "$ID")"
+readonly LAYOUT_ENCODED
 
 # Device auth (same as api_client.py): device_id = hostname, secret = /etc/machine-id
 DEVICE_ID="$(hostname)"
@@ -304,7 +309,7 @@ update_playback_mode() {
 # 'ads' selects the website's mixed image/video/YouTube station player.
 # Other values retain the existing web-station kiosk routes.
 requested_kiosk_content() {
-  if [[ "$ID" == *,* ]]; then
+  if [[ "$ID" == *,* || -n "${LAYOUT_ENCODED:-}" ]]; then
     printf '%s\n' ads
     return 0
   fi
@@ -1201,11 +1206,12 @@ launch_web_kiosk() {
     local kiosk_query
     kiosk_query="$(jq -rn --arg deviceId "$DEVICE_ID" --arg secret "$DEVICE_SECRET" \
       --arg playbackSession "$PLAYBACK_SESSION" --arg stations "$ID" --arg unmutedId "${UNMUTED_ID:-}" \
-      --arg orientation "$orientation" \
+      --arg orientation "$orientation" --arg layout "${LAYOUT_ENCODED:-}" \
       '($unmutedId | ascii_upcase | gsub("^\\s+|\\s+$"; "")) as $unmute
        | {kiosk:"1",deviceId:$deviceId,secret:$secret,playbackSession:$playbackSession,orientation:$orientation,index:"-2"}
        + (if $unmute != "" and (($stations | split(",") | index($unmute)) != null)
           then {unmute:$unmute} else {} end)
+       + (if $layout != "" then {layout:$layout} else {} end)
        | to_entries | map((.key | @uri) + "=" + (.value | @uri)) | join("&")')"
     kiosk_url="https://${api_host}/ads/$(jq -rn --arg id "$ID" '$id | @uri')?${kiosk_query}"
   else
@@ -1376,7 +1382,7 @@ main() {
   log "Player version=${PLAYER_VERSION}"
   log "Device EVENT_SLOT=${EVENT_SLOT} (askForEvent during second ${EVENT_SLOT} of each minute)"
   idx="$(cat "$INDEX_FILE" 2>/dev/null || echo "0")"
-  if [[ "$ID" == *,* ]]; then
+  if [[ "$ID" == *,* || -n "${LAYOUT_ENCODED:-}" ]]; then
     log "Starting independent Chromium panels for ad stations: $ID"
   elif fetch_batch_to "$idx" "$blast_idx" "$PENDING_LIST" "$NEXT_FILE" "$NEXT_BLAST_FILE"; then
     promote_main_list "$PENDING_LIST"

@@ -12,6 +12,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 import playback_mode as mode
 import playback_report as report
+import ad_layout as layout
+from test_ad_layout import config_block, panel, raw
 
 
 def functions(*names):
@@ -331,15 +333,17 @@ main
 
     def launch_kiosk(self, stations="STATION", orientation="90", *, unmuted_id=None,
                      content="ads", secret="secret-test", supervised=False,
-                     kms_output="", kms_status=0, expected_size="1920,1080"):
+                     kms_output="", kms_status=0, expected_size="1920,1080", layout_value=None):
         for name in ("launched", "args", "rotation", "xset-args"):
             (self.root / name).unlink(missing_ok=True)
         (self.root / "kms-output").write_text(kms_output)
         settings = {"ID": stations, "ORIENTATION": orientation, "UNMUTED_ID": unmuted_id,
                     "WEB_STATION": "WEB-STATION", "DEVICE_SECRET": secret,
-                    "KMS_STATUS": str(kms_status)}
-        config = "\n".join(f"unset {key}" if value is None else f"{key}={shlex.quote(value)}"
-                           for key, value in settings.items()) + "\n"
+                    "KMS_STATUS": str(kms_status), "LAYOUT": layout_value}
+        config_file = self.root / "config.env"
+        config_file.write_text("\n".join(f"unset {key}" if value is None else f"{key}={shlex.quote(value)}"
+                                         for key, value in settings.items()) + "\n")
+        config = f"CONFIG={shlex.quote(str(config_file))}\n" + config_block()
         command = "sync_web_kiosk" if supervised else "launch_web_kiosk " + shlex.quote(content)
         output = self.run_shell(config + r'''
 rm() { :; }
@@ -429,7 +433,7 @@ echo NO-KMS
 ''', names=("kms_window_size",))
         self.assertEqual(output, "NO-KMS\n")
 
-    def assert_ads_url(self, parts, stations, orientation, *, unmute=None, secret="secret-test"):
+    def assert_ads_url(self, parts, stations, orientation, *, unmute=None, secret="secret-test", layout_value=None):
         self.assertEqual(unquote(parts.path), "/ads/" + stations)
         expected = {
             "kiosk": ["1"], "deviceId": ["device-test"], "secret": [secret],
@@ -438,7 +442,65 @@ echo NO-KMS
         }
         if unmute is not None:
             expected["unmute"] = [unmute]
+        if layout_value:
+            expected["layout"] = [layout.compile_layout(layout_value, stations)]
         self.assertEqual(parse_qs(parts.query, keep_blank_values=True), expected)
+
+    def test_layout_preserves_path_order_index_audio_rotation_and_escaped_credentials(self):
+        secret = "secret&+=?# /%"
+        for value in ("a:70 | (b / c):30", "(a | b) / c"):
+            with self.subTest(layout=value):
+                parts = self.launch_kiosk("c,a,b", "270", unmuted_id=" b ", secret=secret,
+                                          supervised=True, layout_value=value)
+                self.assert_ads_url(parts, "C,A,B", "270", unmute="B", secret=secret, layout_value=value)
+                # Geometry order never changes the authorized path / playlist index pairing.
+                encoded = parse_qs(parts.query)["layout"][0]
+                self.assertEqual([p["station"] for p in layout.decode_layout(encoded)["panels"]], ["A", "B", "C"])
+
+    def test_encoded_layout_preserves_overlaps_layer_order_and_panel_fits(self):
+        value = "base64url:" + raw({"v": 1, "panels": [panel("b", fit="cover"), panel("a", 60, 60, 30, 30, fit="contain")]})
+        parts = self.launch_kiosk("A,B", "90", unmuted_id="a", supervised=True, layout_value=value)
+        self.assert_ads_url(parts, "A,B", "90", unmute="A", layout_value=value)
+
+    def test_explicit_single_panel_selects_browser_and_blank_returns_to_normal_mode(self):
+        self.set_mode(False)
+        parts = self.launch_kiosk(layout_value="station", supervised=True)
+        self.assert_ads_url(parts, "STATION", "90", layout_value="station")
+        self.assertEqual((self.root / "ACTIVE_MODE_FILE").read_text(), "chromium\n")
+        self.assertEqual(self.run_shell('requested_kiosk_content', names=("requested_kiosk_content",)), "")
+
+    def test_blank_layout_is_omitted_from_ads_url(self):
+        for value in (None, "", " \t"):
+            parts = self.launch_kiosk("A,B", layout_value=value)
+            self.assert_ads_url(parts, "A,B", "90")
+
+    def test_layout_boot_avoids_native_fetch_and_keeps_heartbeat_and_daily_restart(self):
+        output = self.run_shell(r'''
+LAYOUT_ENCODED="$(printf '%s' STATION | python3 "$SCRIPT_DIR/ad_layout.py" "$ID")"
+ensure_dirs() { :; }
+start_wifi_hotkey() { :; }
+clear_sync_pending() { :; }
+event_poll_loop() { echo HEARTBEATS; }
+fetch_batch_to() { echo WRONG-STARTUP-FETCH; exit 99; }
+start_mpv_if_needed() { echo WRONG-MPV; exit 99; }
+start_background_fetch_pending() { echo WRONG-PREFETCH; exit 99; }
+wait_while_wizard() { :; }
+chromium_running() { [[ -f "$STATE_DIR/chrome" ]]; }
+kiosk_startx_alive() { chromium_running; }
+x_display_running() { return 1; }
+launch_web_kiosk() { echo "CHROME $1"; touch "$STATE_DIR/chrome"; }
+date() { if [[ -f "$STATE_DIR/clock" ]]; then echo 86401; else touch "$STATE_DIR/clock"; echo 0; fi; }
+main
+''', names=("main", "requested_kiosk_content", "sync_web_kiosk", "ensure_web_kiosk_healthy"), expected=70)
+        self.assertIn("CHROME ads", output)
+        self.assertIn("HEARTBEATS", output)
+        self.assertIn("RESTART: daily browser refresh with a new playback session", output)
+        self.assertNotIn("WRONG", output)
+
+    def test_layout_is_not_appended_to_scheduled_web_page_urls(self):
+        parts = self.launch_kiosk(content="bay101poker", layout_value="STATION")
+        self.assertEqual(parts.path, "/player/90/bay101poker")
+        self.assertEqual(parse_qs(parts.query), {"id": ["WEB-STATION"], "secret": ["secret-test"]})
 
     def test_ads_orientation_preserves_stations_unmute_and_kiosk_credentials(self):
         for stations, unmuted_id, unmute in (("STATION", " station ", "STATION"),
