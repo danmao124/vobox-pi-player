@@ -32,7 +32,10 @@ def browser_content(path, station):
     if len(station_ids(station)) > 1:
         return "ads"
     state = read_state(path, station)
-    if state.get("hasYoutube") is True:
+    requires_browser = state.get("requiresBrowser")
+    if type(requires_browser) is not bool:
+        requires_browser = state.get("hasYoutube") is True
+    if requires_browser:
         return "ads"
     return state.get("webContent") or ""
 
@@ -42,8 +45,9 @@ def update_state(path, station, requested_at, payload):
     if not isinstance(response, dict) or response.get("success") is not True:
         return
     updates = {}
-    if type(response.get("hasYoutube")) is bool:
-        updates["hasYoutube"] = response["hasYoutube"]
+    for key in ("requiresBrowser", "hasYoutube"):
+        if type(response.get(key)) is bool:
+            updates[key] = response[key]
     if "webContent" in response and (
         response["webContent"] is None or isinstance(response["webContent"], str)
     ):

@@ -12,8 +12,12 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 import playback_mode as mode
 import playback_report as report
-import ad_layout as layout
-from test_ad_layout import config_block, panel, raw
+
+
+def config_block():
+    source = (ROOT / "tvads.sh").read_text()
+    # Exercise startup config without touching auth, devices, or renderers.
+    return source.split("# ---------- load config ----------", 1)[1].split("# Device auth", 1)[0]
 
 
 def functions(*names):
@@ -51,6 +55,36 @@ class PlaybackModeStateTests(unittest.TestCase):
         self.update(3)
         mode.update_state(self.path, "STATION", 4, response(success=False, hasYoutube=False))
         self.assertEqual(mode.browser_content(self.path, "STATION"), "ads")
+
+    def test_requires_browser_selects_layout_and_explicit_false_clears_it(self):
+        self.update(10, requiresBrowser=True, hasYoutube=False, webContent="bay101poker")
+        self.assertEqual(mode.browser_content(self.path, "station"), "ads")
+        self.update(30, requiresBrowser=False, hasYoutube=True)
+        self.assertEqual(mode.browser_content(self.path, "station"), "bay101poker")
+        self.update(20, requiresBrowser=True)
+        self.assertEqual(mode.browser_content(self.path, "station"), "bay101poker")
+        self.update(40, webContent=None)
+        self.assertEqual(mode.browser_content(self.path, "station"), "")
+
+    def test_confirmed_requires_browser_survives_missing_invalid_and_failed_responses(self):
+        self.update(1, requiresBrowser=True, hasYoutube=False)
+        for value in (None, "false", "true", 0, 1, [], {}):
+            with self.subTest(value=value):
+                self.update(2, requiresBrowser=value, hasYoutube=False)
+                self.assertEqual(mode.browser_content(self.path, "STATION"), "ads")
+        self.update(3, hasYoutube=False)
+        mode.update_state(self.path, "STATION", 4, response(success=False, requiresBrowser=False))
+        self.assertEqual(mode.browser_content(self.path, "STATION"), "ads")
+        self.assertEqual(mode.browser_content(self.path, "OTHER"), "")
+
+    def test_legacy_state_remains_usable_until_new_signal_is_confirmed(self):
+        self.update(10, hasYoutube=True)
+        self.update(20, requiresBrowser="false")
+        self.assertEqual(mode.browser_content(self.path, "STATION"), "ads")
+        self.update(30, requiresBrowser=False)
+        self.assertEqual(mode.browser_content(self.path, "STATION"), "")
+        self.update(40, hasYoutube=True)
+        self.assertEqual(mode.browser_content(self.path, "STATION"), "")
 
     def test_web_schedule_is_preserved_by_heartbeat_but_cleared_explicitly(self):
         self.update(1, webContent="bay101poker", hasYoutube=False)
@@ -100,6 +134,16 @@ class PlaybackModeStateTests(unittest.TestCase):
         self.assertEqual(rc, 3)
         sleeper.assert_called_once()
 
+    def test_layout_signal_interrupts_native_image_without_youtube(self):
+        self.update(1, requiresBrowser=False, hasYoutube=False)
+        with patch.object(report.time, "monotonic_ns", return_value=100_000_000_000), \
+                patch.object(report.time, "sleep", side_effect=lambda _: self.update(2, requiresBrowser=True)) as sleeper:
+            rc = report.wait_image("100000000000", 15, str(self.path) + ".wizard",
+                                   str(self.path) + ".at", str(self.path) + ".list",
+                                   str(self.path), "STATION")
+        self.assertEqual(rc, 3)
+        sleeper.assert_called_once()
+
 
 class PlaybackModeShellTests(unittest.TestCase):
     def setUp(self):
@@ -140,6 +184,37 @@ restart_player() { echo "RESTART: $1"; exit 70; }
     def set_mode(self, enabled):
         (self.root / "PLAYBACK_MODE_FILE").unlink(missing_ok=True)
         mode.update_state(self.root / "PLAYBACK_MODE_FILE", "STATION", 1, response(hasYoutube=enabled))
+
+    def test_requires_browser_from_either_endpoint_launches_layout_without_config_flag(self):
+        station = "APNIMANDI-41081-94538-MAIN"
+        (self.root / "layout-response.json").write_text(json.dumps(response(
+            requiresBrowser=True, hasYoutube=False, index=0, blastIndex=0)))
+        for command in ('fetch_batch_to 0 0 "$PENDING_LIST" "$NEXT_FILE" "$NEXT_BLAST_FILE"', 'ask_for_event'):
+            with self.subTest(command=command):
+                (self.root / "PLAYBACK_MODE_FILE").unlink(missing_ok=True)
+                self.run_shell(f"ID={station}\n" + r'''
+build_event_body() { echo '{}'; }
+curl() { cat "$STATE_DIR/layout-response.json"; }
+''' + command, names=("ask_for_event", "fetch_batch_to", "update_playback_mode"))
+                parts = self.launch_kiosk(station, unmuted_id=" abc ", supervised=True)
+                self.assert_ads_url(parts, station, "90", unmute="ABC")
+                self.assertEqual((self.root / "ACTIVE_MODE_FILE").read_text(), "chromium\n")
+
+    def test_shell_and_python_agree_on_browser_signal_precedence(self):
+        updates = [
+            {"hasYoutube": True},
+            {"requiresBrowser": False},
+            {"requiresBrowser": True, "hasYoutube": False},
+            {"requiresBrowser": None, "hasYoutube": False},
+            {"hasYoutube": False},
+            {"requiresBrowser": False, "webContent": "bay101poker"},
+            {"webContent": None},
+        ]
+        for at, (fields, expected) in enumerate(zip(updates, ("ads", "", "ads", "ads", "ads", "bay101poker", ""))):
+            with self.subTest(fields=fields):
+                mode.update_state(self.root / "PLAYBACK_MODE_FILE", "STATION", at, response(**fields))
+                self.assertEqual(mode.browser_content(self.root / "PLAYBACK_MODE_FILE", "STATION"), expected)
+                self.assertEqual(self.run_shell('requested_kiosk_content', names=("requested_kiosk_content",)).strip(), expected)
 
     def test_heartbeat_sets_true_and_empty_billboard_explicitly_clears_it(self):
         (self.root / "heartbeat.json").write_text(json.dumps(response(hasYoutube=True)))
@@ -333,13 +408,13 @@ main
 
     def launch_kiosk(self, stations="STATION", orientation="90", *, unmuted_id=None,
                      content="ads", secret="secret-test", supervised=False,
-                     kms_output="", kms_status=0, expected_size="1920,1080", layout_value=None):
+                     kms_output="", kms_status=0, expected_size="1920,1080"):
         for name in ("launched", "args", "rotation", "xset-args"):
             (self.root / name).unlink(missing_ok=True)
         (self.root / "kms-output").write_text(kms_output)
         settings = {"ID": stations, "ORIENTATION": orientation, "UNMUTED_ID": unmuted_id,
                     "WEB_STATION": "WEB-STATION", "DEVICE_SECRET": secret,
-                    "KMS_STATUS": str(kms_status), "LAYOUT": layout_value}
+                    "KMS_STATUS": str(kms_status)}
         config_file = self.root / "config.env"
         config_file.write_text("\n".join(f"unset {key}" if value is None else f"{key}={shlex.quote(value)}"
                                          for key, value in settings.items()) + "\n")
@@ -433,7 +508,7 @@ echo NO-KMS
 ''', names=("kms_window_size",))
         self.assertEqual(output, "NO-KMS\n")
 
-    def assert_ads_url(self, parts, stations, orientation, *, unmute=None, secret="secret-test", layout_value=None):
+    def assert_ads_url(self, parts, stations, orientation, *, unmute=None, secret="secret-test"):
         self.assertEqual(unquote(parts.path), "/ads/" + stations)
         expected = {
             "kiosk": ["1"], "deviceId": ["device-test"], "secret": [secret],
@@ -442,73 +517,26 @@ echo NO-KMS
         }
         if unmute is not None:
             expected["unmute"] = [unmute]
-        if layout_value:
-            expected["layout"] = [layout.compile_layout(layout_value, stations)]
         self.assertEqual(parse_qs(parts.query, keep_blank_values=True), expected)
 
-    def test_layout_preserves_path_order_index_audio_rotation_and_escaped_credentials(self):
+    def test_multi_station_preserves_path_order_index_audio_rotation_and_escaped_credentials(self):
         secret = "secret&+=?# /%"
-        for value in ("a:70 | (b / c):30", "(a | b) / c"):
-            with self.subTest(layout=value):
-                parts = self.launch_kiosk("c,a,b", "270", unmuted_id=" b ", secret=secret,
-                                          supervised=True, layout_value=value)
-                self.assert_ads_url(parts, "C,A,B", "270", unmute="B", secret=secret, layout_value=value)
-                # Geometry order never changes the authorized path / playlist index pairing.
-                encoded = parse_qs(parts.query)["layout"][0]
-                self.assertEqual([p["station"] for p in layout.decode_layout(encoded)["panels"]], ["A", "B", "C"])
-
-    def test_encoded_layout_preserves_overlaps_layer_order_and_panel_fits(self):
-        value = "base64url:" + raw({"v": 1, "panels": [panel("b", fit="cover"), panel("a", 60, 60, 30, 30, fit="contain")]})
-        parts = self.launch_kiosk("A,B", "90", unmuted_id="a", supervised=True, layout_value=value)
-        self.assert_ads_url(parts, "A,B", "90", unmute="A", layout_value=value)
-
-    def test_explicit_single_panel_selects_browser_and_blank_returns_to_normal_mode(self):
-        self.set_mode(False)
-        parts = self.launch_kiosk(layout_value="station", supervised=True)
-        self.assert_ads_url(parts, "STATION", "90", layout_value="station")
-        self.assertEqual((self.root / "ACTIVE_MODE_FILE").read_text(), "chromium\n")
-        self.assertEqual(self.run_shell('requested_kiosk_content', names=("requested_kiosk_content",)), "")
-
-    def test_blank_layout_is_omitted_from_ads_url(self):
-        for value in (None, "", " \t"):
-            parts = self.launch_kiosk("A,B", layout_value=value)
-            self.assert_ads_url(parts, "A,B", "90")
-
-    def test_layout_boot_avoids_native_fetch_and_keeps_heartbeat_and_daily_restart(self):
-        output = self.run_shell(r'''
-LAYOUT_ENCODED="$(printf '%s' STATION | python3 "$SCRIPT_DIR/ad_layout.py" "$ID")"
-ensure_dirs() { :; }
-start_wifi_hotkey() { :; }
-clear_sync_pending() { :; }
-event_poll_loop() { echo HEARTBEATS; }
-fetch_batch_to() { echo WRONG-STARTUP-FETCH; exit 99; }
-start_mpv_if_needed() { echo WRONG-MPV; exit 99; }
-start_background_fetch_pending() { echo WRONG-PREFETCH; exit 99; }
-wait_while_wizard() { :; }
-chromium_running() { [[ -f "$STATE_DIR/chrome" ]]; }
-kiosk_startx_alive() { chromium_running; }
-x_display_running() { return 1; }
-launch_web_kiosk() { echo "CHROME $1"; touch "$STATE_DIR/chrome"; }
-date() { if [[ -f "$STATE_DIR/clock" ]]; then echo 86401; else touch "$STATE_DIR/clock"; echo 0; fi; }
-main
-''', names=("main", "requested_kiosk_content", "sync_web_kiosk", "ensure_web_kiosk_healthy"), expected=70)
-        self.assertIn("CHROME ads", output)
-        self.assertIn("HEARTBEATS", output)
-        self.assertIn("RESTART: daily browser refresh with a new playback session", output)
-        self.assertNotIn("WRONG", output)
-
-    def test_layout_is_not_appended_to_scheduled_web_page_urls(self):
-        parts = self.launch_kiosk(content="bay101poker", layout_value="STATION")
-        self.assertEqual(parts.path, "/player/90/bay101poker")
-        self.assertEqual(parse_qs(parts.query), {"id": ["WEB-STATION"], "secret": ["secret-test"]})
+        parts = self.launch_kiosk(" c,a,b,a ", "270", unmuted_id=" b ", secret=secret, supervised=True)
+        self.assert_ads_url(parts, "C,A,B", "270", unmute="B", secret=secret)
 
     def test_ads_orientation_preserves_stations_unmute_and_kiosk_credentials(self):
         for stations, unmuted_id, unmute in (("STATION", " station ", "STATION"),
-                                            ("BABY,PEPE", " baby ", "BABY")):
+                                            ("BABY,PEPE", " baby ", "BABY"),
+                                            ("STATION", " child ", "CHILD"),
+                                            ("BABY,PEPE", " child ", "CHILD")):
             for angle in ("0", "90", "180", "270"):
                 with self.subTest(stations=stations, angle=angle):
                     parts = self.launch_kiosk(stations, angle, unmuted_id=unmuted_id)
                     self.assert_ads_url(parts, stations, angle, unmute=unmute)
+
+    def test_nested_unmute_is_encoded_as_one_query_value(self):
+        parts = self.launch_kiosk(unmuted_id=" child&index=99# /% ")
+        self.assert_ads_url(parts, "STATION", "90", unmute="CHILD&INDEX=99# /%")
 
     def test_missing_blank_or_invalid_browser_orientation_defaults_to_zero(self):
         for orientation in (None, "", "45", "-90", "360", "90.0", "invalid", "90&unmute=PEPE"):
@@ -518,7 +546,7 @@ main
 
     def test_orientation_preserves_muted_defaults_and_query_encoding(self):
         secret = "secret&+=?# /%"
-        for unmuted_id in (None, "", "  ", "OTHER", "BABY,PEPE"):
+        for unmuted_id in (None, "", "  ", "BABY,PEPE"):
             with self.subTest(unmuted_id=unmuted_id):
                 parts = self.launch_kiosk("BABY,PEPE", "270", unmuted_id=unmuted_id, secret=secret)
                 self.assert_ads_url(parts, "BABY,PEPE", "270", secret=secret)
@@ -536,7 +564,7 @@ main
     def test_scheduled_web_pages_keep_orientation_path_and_rotate_only_in_website(self):
         for angle in ("0", "90", "180", "270"):
             with self.subTest(angle=angle):
-                parts = self.launch_kiosk(orientation=angle, content="bay101poker")
+                parts = self.launch_kiosk(orientation=angle, content="bay101poker", unmuted_id="CHILD")
                 self.assertEqual(parts.path, f"/player/{angle}/bay101poker")
                 self.assertEqual(parse_qs(parts.query), {"id": ["WEB-STATION"], "secret": ["secret-test"]})
 
