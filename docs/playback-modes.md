@@ -1,5 +1,9 @@
 # Native and Chromium playback
 
+Release `2026.10.11.6` applies explicit kernel `video=` resolutions to X before
+launching Chromium. A venue's configured HDMI mode takes precedence over X's
+automatic choice, and Chromium is sized after the configured mode is applied.
+
 Release `2026.10.11.5` detects Chromium by its process name rather than its launcher
 path. This lets startup proceed to the native heartbeat when the actual browser
 runs from `/usr/lib/chromium/chromium`, so its layout session can register.
@@ -80,24 +84,52 @@ use the same launch URL builder.
 
 `startx` runs `tvads.sh --chromium-session <url>` as its X client. This entry point
 skips supervisor initialization and inherits the session's `DISPLAY` and
-`XAUTHORITY`. It reads the current X screen size with `xrandr --current` and uses
-it for Chromium's `--window-size` (for example, `3840,2160` for a 4K X screen).
-The console can be 1536×768 before X switches to 3840×2160, so the player must not
-choose Chromium's size before starting X.
+`XAUTHORITY`. It first runs `display_mode.py`, which reads the effective boot
+arguments from `/proc/cmdline`. For example:
+
+```text
+video=HDMI-A-1:1536x768M@60
+```
+
+This selects 1536×768 at approximately 60 Hz on the corresponding X output
+(typically `HDMI-1`), even if X initially selected 4K. It verifies the active
+output dimensions and refresh rate, then reads the X screen size with
+`xrandr --current` for Chromium's `--window-size`. This changes the HDMI mode,
+not just the browser window. The mode change can briefly blank the screen.
+
+Existing X modes are used first. If a custom `M` (CVT) mode is missing, the helper
+uses `cvt` and `xrandr --newmode/--addmode` to create it; `MR` retains reduced
+blanking. Install the `xcvt` package providing `cvt` if that fallback is needed.
+Missing interlaced/margin modes are not synthesized. If a configured mode cannot
+be applied or verified, startup logs an error and does not launch Chromium at a
+different resolution. The supervisor restarts through systemd as before.
+
+Connector-specific overrides only affect that output. Disconnected outputs are
+skipped; an unknown connector is an error. A global `video=WIDTHxHEIGHT...` is
+accepted only when exactly one X output is connected. Multiple explicit
+connector resolutions are applied separately. Console rotation/margin options
+do not replace the website's existing `ORIENTATION` behavior.
+
+Without explicit numeric `video=` dimensions, the player retains X's automatic
+mode selection. Reboot after editing `/boot/firmware/cmdline.txt` so the effective
+boot arguments reflect the change. The player does not rewrite that file.
 
 If X sizing is unavailable, the client samples `kmsprint` **after X startup**,
 using the first connected output with an active CRTC and checking other DRM cards
 if needed. If both queries fail, it falls back to `1920,1080` with a warning.
-Neither query changes the HDMI mode or refresh rate. Orientation still happens
-in the website, so the window dimensions are not swapped. Screen blanking/DPMS
-setup also runs inside the authenticated X session; the client then `exec`s
+These fallback queries do not change the HDMI mode or refresh rate. Orientation
+still happens in the website, so the window dimensions are not swapped. Screen
+blanking/DPMS setup also runs inside the authenticated X session; the client then `exec`s
 Chromium so exiting the browser tears down X through the existing supervisor.
 
 Install `x11-xserver-utils` for `xrandr`/`xset`, and `kms++-utils` for the KMS
 fallback. After deploying, restart the player with the TV connected and check
 `Chromium window size from X: 3840x2160` (or the explicitly labeled post-X KMS
-fallback). An SSH shell may need the X session's authentication environment to
-run `xrandr`; setting only `DISPLAY=:0` does not supply its authentication cookie.
+fallback) on an automatic 4K screen. With the override above, check for
+`Applied boot display mode: HDMI-1 1536x768 at 60 Hz` followed by
+`Chromium window size from X: 1536x768`. Run `kmsprint` while the player is active
+to verify the actual HDMI mode. An SSH shell may need the X session's authentication
+environment to run `xrandr`; setting only `DISPLAY=:0` does not supply its authentication cookie.
 
 The native heartbeat runs immediately after startup and then once per minute in
 the device's existing slot. It continues while Chromium is active. Browser mode
@@ -150,7 +182,7 @@ of frame-accurate decoding or YouTube network startup.
 ## Deployment and verification
 
 Deploy the backend and website protocol support before enabling this player
-release. Deploy `tvads.sh`, `playback_report.py`, and `playback_mode.py` together
+release. Deploy `tvads.sh`, `display_mode.py`, `playback_report.py`, and `playback_mode.py` together
 and restart the player service. The existing service must restart on exit and
 terminate its entire control group. Chromium, `startx`, and `xset` are required.
 Deploy the website's `/ads?orientation=` and backend-defined layout station support

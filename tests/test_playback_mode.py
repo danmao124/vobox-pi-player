@@ -518,8 +518,13 @@ exec() {
   printf '%s\n' "$@" > "$STATE_DIR/args"
   touch "$STATE_DIR/launched"
 }
+python3() {
+  # Display-mode behavior has separate tests with isolated xrandr processes.
+  [[ "$1" != */display_mode.py ]] || return 0
+  command python3 "$@"
+}
 export STATE_DIR KMS_STATUS XRANDR_STATUS
-export -f kmsprint xset xrandr exec
+export -f kmsprint xset xrandr exec python3
 # Use real sleep while the harmless startx stub writes its marker.
 ''' + command + "\nwait\n", names=("kms_window_size", "launch_web_kiosk", "sync_web_kiosk",
                                           "ensure_web_kiosk_healthy", "requested_kiosk_content",
@@ -622,7 +627,8 @@ exec() {
   echo BROWSER-STARTED
   return 37
 }
-export -f xrandr xset exec
+python3() { [[ "$1" == */display_mode.py ]]; }
+export -f xrandr xset exec python3
 /bin/bash "$SCRIPT_DIR/tvads.sh" --chromium-session 'https://example.test/ads/STATION?secret=test-only'
 ''', expected=37)
         self.assertIn("Chromium window size from X: 3840x2160", output)

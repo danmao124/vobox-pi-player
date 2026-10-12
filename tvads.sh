@@ -3,7 +3,7 @@ set -euo pipefail
 
 # Bump for each player release, including changes to playback_report.py.
 # Captured by the running process; updating files takes effect after restart.
-readonly PLAYER_VERSION="2026.10.11.5"
+readonly PLAYER_VERSION="2026.10.11.6"
 
 log(){ echo "[$(date '+%F %T')] $*"; }
 
@@ -61,6 +61,12 @@ x_window_size() {
 
 run_chromium_session() {
   local kiosk_url="$1" window_size
+  # X can replace the console mode. Honor explicit kernel video= dimensions
+  # before measuring its screen; never silently substitute a different mode.
+  if ! python3 "$(dirname "${BASH_SOURCE[0]}")/display_mode.py"; then
+    log "ERROR: configured display mode failed; Chromium was not started"
+    return 1
+  fi
   if window_size="$(x_window_size)"; then
     log "Chromium window size from X: ${window_size/,/x}"
   elif window_size="$(kms_window_size)"; then
@@ -1310,8 +1316,8 @@ launch_web_kiosk() {
     -- :0 -nocursor -s off &
   CHROMIUM_PID=$!
 
-  # The main loop checks kiosk health immediately; don't mistake startup for a crash.
-  for _ in {1..100}; do
+  # Allow explicit mode setup and browser startup before the normal health checks.
+  for _ in {1..600}; do
     chromium_running && return 0
     kiosk_startx_alive || break
     sleep 0.1
