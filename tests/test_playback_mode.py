@@ -406,10 +406,32 @@ main
         self.assertIn("RESTART: daily browser refresh with a new playback session", output)
         self.assertNotIn("MPV", output)
 
+    def test_chromium_detection_uses_process_name_not_launcher_path(self):
+        for comm, args, running in (
+            ("chromium", "/usr/lib/chromium/chromium --kiosk", True),
+            ("chromium", "/opt/chromium/chromium --kiosk", True),
+            ("sh", "/bin/sh /usr/bin/chromium --kiosk", False),
+            ("xinit", "/usr/bin/xinit /usr/bin/chromium --kiosk", False),
+            ("bash", "/bin/bash /data/player/tvads.sh --chromium-session", False),
+        ):
+            with self.subTest(comm=comm, args=args):
+                output = self.run_shell(
+                    f"PROCESS_COMM={shlex.quote(comm)}\nPROCESS_ARGS={shlex.quote(args)}\n" + r'''
+pgrep() {
+  case "$1" in
+    -x) [[ "$PROCESS_COMM" == "$2" ]];;
+    -f) [[ "$PROCESS_ARGS" =~ $2 ]];;
+    *) exit 99;;
+  esac
+}
+if chromium_running; then echo running; else echo stopped; fi
+''', names=("chromium_running",))
+                self.assertEqual(output.strip(), "running" if running else "stopped")
+
     def launch_kiosk(self, stations="STATION", orientation="90", *, unmuted_id=None,
                      content="ads", secret="secret-test", supervised=False,
                      kms_output="", kms_status=0, expected_size="1920,1080",
-                     x_output="", x_status=0, kms_before_output=""):
+                     x_output="", x_status=0, kms_before_output="", main_startup=False):
         for name in ("launched", "args", "rotation", "xset-args", "x-ready",
                      "startx-args", "xrandr-calls", "kms-calls"):
             (self.root / name).unlink(missing_ok=True)
@@ -424,6 +446,34 @@ main
                                          for key, value in settings.items()) + "\n")
         config = f"CONFIG={shlex.quote(str(config_file))}\n" + config_block()
         command = "sync_web_kiosk" if supervised else "launch_web_kiosk " + shlex.quote(content)
+        if main_startup:
+            command = r'''
+ensure_dirs() { :; }
+start_wifi_hotkey() { :; }
+clear_sync_pending() { :; }
+fetch_batch_to() { : > "$3"; echo 0 > "$4"; echo 0 > "$5"; }
+promote_main_list() { mv "$1" "$MAIN_LIST"; }
+read_next_blast_index() { :; }
+start_mpv_if_needed() { exit 99; }
+start_background_fetch_pending() { exit 99; }
+wait_while_wizard() { wait; exit 0; }
+# Exercise the real immediate heartbeat and request builder, then end the worker.
+sleep() {
+  [[ -f "$STATE_DIR/heartbeat.json" ]] && exit 0
+  command sleep "$@"
+}
+curl() {
+  while (( $# )); do
+    if [[ "$1" == -d ]]; then
+      printf '%s' "$2" > "$STATE_DIR/heartbeat.json"
+      break
+    fi
+    shift
+  done
+  echo '{"response":{"success":true,"data":[]}}'
+}
+main
+'''
         output = self.run_shell(config + r'''
 rm() { :; }
 kmsprint() {
@@ -436,7 +486,15 @@ kmsprint() {
   fi
   return "$KMS_STATUS"
 }
-chromium_running() { [[ -f "$STATE_DIR/launched" ]]; }
+pgrep() {
+  [[ -f "$STATE_DIR/launched" ]] || return 1
+  # Debian's /usr/bin launcher execs the browser at a different path.
+  case "$1" in
+    -x) [[ chromium == "$2" ]];;
+    -f) [[ '/usr/lib/chromium/chromium --kiosk' =~ $2 ]];;
+    *) exit 99;;
+  esac
+}
 kiosk_startx_alive() { [[ -n "$CHROMIUM_PID" ]]; }
 x_display_running() { return 1; }
 kill_web_kiosk() { exit 99; }
@@ -464,7 +522,9 @@ export STATE_DIR KMS_STATUS XRANDR_STATUS
 export -f kmsprint xset xrandr exec
 # Use real sleep while the harmless startx stub writes its marker.
 ''' + command + "\nwait\n", names=("kms_window_size", "launch_web_kiosk", "sync_web_kiosk",
-                                          "ensure_web_kiosk_healthy", "requested_kiosk_content"))
+                                          "ensure_web_kiosk_healthy", "requested_kiosk_content",
+                                          "chromium_running", "main", "event_poll_loop",
+                                          "ask_for_event", "build_event_body", "update_playback_mode"))
         args = (self.root / "args").read_text().splitlines()
         url = next(arg for arg in args if arg.startswith("https://"))
         parts = urlsplit(url)
@@ -494,6 +554,19 @@ export -f kmsprint xset xrandr exec
         elif kms_status != 0 or not kms_output:
             self.assertIn("WARN: no active resolution from X or kmsprint; using Chromium window size 1920x1080", output)
         return parts
+
+    def test_layout_startup_registers_the_same_session_as_the_4k_browser(self):
+        station = "APNIMANDI-41081-94538-MAIN"
+        mode.update_state(self.root / "PLAYBACK_MODE_FILE", station, 1,
+                          response(requiresBrowser=True))
+        parts = self.launch_kiosk(station, main_startup=True,
+                                  x_output="Screen 0: current 3840 x 2160, maximum 16384 x 16384\n",
+                                  expected_size="3840,2160")
+        body = json.loads((self.root / "heartbeat.json").read_text())
+        self.assertEqual(body["playbackSession"], parse_qs(parts.query)["playbackSession"][0])
+        self.assertEqual(body["adStationIds"], [station])
+        self.assertEqual(body["adStationId"], station)
+        self.assertEqual(body["playbackMode"], "chromium")
 
     def test_kiosk_sizes_after_x_changes_console_mode_to_4k(self):
         console = "Connector 0 (33) HDMI-A-1 (connected)\n    Crtc 2 (92) 1536x768@60.00\n"

@@ -3,7 +3,7 @@ set -euo pipefail
 
 # Bump for each player release, including changes to playback_report.py.
 # Captured by the running process; updating files takes effect after restart.
-readonly PLAYER_VERSION="2026.10.11.4"
+readonly PLAYER_VERSION="2026.10.11.5"
 
 log(){ echo "[$(date '+%F %T')] $*"; }
 
@@ -165,7 +165,7 @@ cleanup() {
     wait "$CHROMIUM_PID" 2>/dev/null || true
     CHROMIUM_PID=""
   fi
-  pkill -f "/usr/bin/chromium" >/dev/null 2>&1 || true
+  pkill -x chromium >/dev/null 2>&1 || true
   pkill -f "X :0" >/dev/null 2>&1 || true
   pkill -f "Xorg :0" >/dev/null 2>&1 || true
 }
@@ -1247,7 +1247,9 @@ play_url() {
 }
 
 chromium_running() {
-  pgrep -f "/usr/bin/chromium" >/dev/null 2>&1
+  # /usr/bin/chromium is a launcher; the actual binary may live under /usr/lib.
+  # Match the browser itself, not startx/xinit arguments containing its path.
+  pgrep -x chromium >/dev/null 2>&1
 }
 
 x_display_running() {
@@ -1324,7 +1326,7 @@ kill_web_kiosk() {
     wait "$CHROMIUM_PID" 2>/dev/null || true
   fi
   CHROMIUM_PID=""
-  pkill -f "/usr/bin/chromium" >/dev/null 2>&1 || true
+  pkill -x chromium >/dev/null 2>&1 || true
   pkill -f "X :0" >/dev/null 2>&1 || true
   pkill -f "Xorg :0" >/dev/null 2>&1 || true
   sleep 0.5

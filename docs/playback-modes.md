@@ -1,5 +1,9 @@
 # Native and Chromium playback
 
+Release `2026.10.11.5` detects Chromium by its process name rather than its launcher
+path. This lets startup proceed to the native heartbeat when the actual browser
+runs from `/usr/lib/chromium/chromium`, so its layout session can register.
+
 Release `2026.10.11.4` sizes Chromium inside the running X session, fixing a small
 top-left browser window when X selects a higher resolution than the console.
 
