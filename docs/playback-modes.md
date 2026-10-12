@@ -1,5 +1,8 @@
 # Native and Chromium playback
 
+Release `2026.10.11.4` sizes Chromium inside the running X session, fixing a small
+top-left browser window when X selects a higher resolution than the console.
+
 Release `2026.10.11.3` reads the boolean `response.requiresBrowser` from successful
 `view/billboard` and `device/askforevent` responses. The backend sets it for layout
 stations or currently eligible playlists that require YouTube/browser playback,
@@ -71,15 +74,26 @@ and swaps its layout width/height at 90/270 degrees. Restart the service after
 changing orientation; startup, renderer changes, recovery, and daily refresh all
 use the same launch URL builder.
 
-Before each Chromium launch, the player reads the first connected output with an
-active CRTC mode from `kmsprint` and uses its width/height for `--window-size`
-(for example, `3840,2160` for a 4K output). It checks other DRM cards if the default
-card has no usable mode. Missing/failed `kmsprint` or no active mode falls back
-to `1920,1080` with a warning. The selected size is logged. This samples the mode
-before X starts; it does not change the HDMI mode or refresh rate. Orientation
-still happens in the website, so the window dimensions are not swapped.
-Install `kms++-utils` if `kmsprint` is missing. After deploying, restart the player
-with the TV connected and check the `Chromium window size from kmsprint` log line.
+`startx` runs `tvads.sh --chromium-session <url>` as its X client. This entry point
+skips supervisor initialization and inherits the session's `DISPLAY` and
+`XAUTHORITY`. It reads the current X screen size with `xrandr --current` and uses
+it for Chromium's `--window-size` (for example, `3840,2160` for a 4K X screen).
+The console can be 1536×768 before X switches to 3840×2160, so the player must not
+choose Chromium's size before starting X.
+
+If X sizing is unavailable, the client samples `kmsprint` **after X startup**,
+using the first connected output with an active CRTC and checking other DRM cards
+if needed. If both queries fail, it falls back to `1920,1080` with a warning.
+Neither query changes the HDMI mode or refresh rate. Orientation still happens
+in the website, so the window dimensions are not swapped. Screen blanking/DPMS
+setup also runs inside the authenticated X session; the client then `exec`s
+Chromium so exiting the browser tears down X through the existing supervisor.
+
+Install `x11-xserver-utils` for `xrandr`/`xset`, and `kms++-utils` for the KMS
+fallback. After deploying, restart the player with the TV connected and check
+`Chromium window size from X: 3840x2160` (or the explicitly labeled post-X KMS
+fallback). An SSH shell may need the X session's authentication environment to
+run `xrandr`; setting only `DISPLAY=:0` does not supply its authentication cookie.
 
 The native heartbeat runs immediately after startup and then once per minute in
 the device's existing slot. It continues while Chromium is active. Browser mode

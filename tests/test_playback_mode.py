@@ -408,13 +408,17 @@ main
 
     def launch_kiosk(self, stations="STATION", orientation="90", *, unmuted_id=None,
                      content="ads", secret="secret-test", supervised=False,
-                     kms_output="", kms_status=0, expected_size="1920,1080"):
-        for name in ("launched", "args", "rotation", "xset-args"):
+                     kms_output="", kms_status=0, expected_size="1920,1080",
+                     x_output="", x_status=0, kms_before_output=""):
+        for name in ("launched", "args", "rotation", "xset-args", "x-ready",
+                     "startx-args", "xrandr-calls", "kms-calls"):
             (self.root / name).unlink(missing_ok=True)
         (self.root / "kms-output").write_text(kms_output)
+        (self.root / "kms-before-output").write_text(kms_before_output)
+        (self.root / "x-output").write_text(x_output)
         settings = {"ID": stations, "ORIENTATION": orientation, "UNMUTED_ID": unmuted_id,
                     "WEB_STATION": "WEB-STATION", "DEVICE_SECRET": secret,
-                    "KMS_STATUS": str(kms_status)}
+                    "KMS_STATUS": str(kms_status), "XRANDR_STATUS": str(x_status)}
         config_file = self.root / "config.env"
         config_file.write_text("\n".join(f"unset {key}" if value is None else f"{key}={shlex.quote(value)}"
                                          for key, value in settings.items()) + "\n")
@@ -422,14 +426,42 @@ main
         command = "sync_web_kiosk" if supervised else "launch_web_kiosk " + shlex.quote(content)
         output = self.run_shell(config + r'''
 rm() { :; }
-kmsprint() { cat "$STATE_DIR/kms-output"; return "$KMS_STATUS"; }
+kmsprint() {
+  if [[ -f "$STATE_DIR/x-ready" ]]; then
+    echo after-X >> "$STATE_DIR/kms-calls"
+    cat "$STATE_DIR/kms-output"
+  else
+    echo before-X >> "$STATE_DIR/kms-calls"
+    cat "$STATE_DIR/kms-before-output"
+  fi
+  return "$KMS_STATUS"
+}
 chromium_running() { [[ -f "$STATE_DIR/launched" ]]; }
 kiosk_startx_alive() { [[ -n "$CHROMIUM_PID" ]]; }
 x_display_running() { return 1; }
 kill_web_kiosk() { exit 99; }
-startx() { printf '%s\n' "$@" > "$STATE_DIR/args"; touch "$STATE_DIR/launched"; }
-xset() { printf '%s\n' "$*" >> "$STATE_DIR/xset-args"; }
-xrandr() { printf '%s\n' "$*" >> "$STATE_DIR/rotation"; }
+startx() {
+  printf '%s\n' "$@" > "$STATE_DIR/startx-args"
+  touch "$STATE_DIR/x-ready"
+  DISPLAY=:77 XAUTHORITY="$STATE_DIR/session-auth" "$1" "$2" "$3" "$4"
+}
+xset() {
+  [[ "$DISPLAY" == :77 && "$XAUTHORITY" == "$STATE_DIR/session-auth" ]] || return 1
+  printf '%s\n' "$*" >> "$STATE_DIR/xset-args"
+}
+xrandr() {
+  [[ -f "$STATE_DIR/x-ready" && "$DISPLAY" == :77 && "$XAUTHORITY" == "$STATE_DIR/session-auth" ]] || return 1
+  printf '%s\n' "$*" >> "$STATE_DIR/xrandr-calls"
+  [[ "$*" == --current ]] || { touch "$STATE_DIR/rotation"; return 1; }
+  cat "$STATE_DIR/x-output"
+  return "$XRANDR_STATUS"
+}
+exec() {
+  printf '%s\n' "$@" > "$STATE_DIR/args"
+  touch "$STATE_DIR/launched"
+}
+export STATE_DIR KMS_STATUS XRANDR_STATUS
+export -f kmsprint xset xrandr exec
 # Use real sleep while the harmless startx stub writes its marker.
 ''' + command + "\nwait\n", names=("kms_window_size", "launch_web_kiosk", "sync_web_kiosk",
                                           "ensure_web_kiosk_healthy", "requested_kiosk_content"))
@@ -444,17 +476,86 @@ xrandr() { printf '%s\n' "$*" >> "$STATE_DIR/rotation"; }
                      f"--window-size={expected_size}", "--force-device-scale-factor=1",
                      "--disable-dev-shm-usage", "--autoplay-policy=no-user-gesture-required"):
             self.assertIn(flag, args)
-        self.assertEqual(args[-5:], ["--", ":0", "-nocursor", "-s", "off"])
+        startx_args = (self.root / "startx-args").read_text().splitlines()
+        self.assertEqual(startx_args[:4], ["/bin/bash", str(ROOT / "tvads.sh"), "--chromium-session", url])
+        self.assertEqual(startx_args[4:], ["--", ":0", "-nocursor", "-s", "off"])
+        self.assertEqual((self.root / "xrandr-calls").read_text(), "--current\n")
+        if (self.root / "kms-calls").exists():
+            self.assertEqual((self.root / "kms-calls").read_text(), "after-X\n")
         self.assertEqual((self.root / "xset-args").read_text().splitlines(),
                          ["q", "s off", "s noblank", "-dpms", "dpms 0 0 0"])
         self.assertFalse((self.root / "rotation").exists(), "Website rotation must not also rotate X")
         self.assertNotIn(secret, output)
         self.assertNotIn("https://", output)
-        if kms_status == 0 and kms_output and expected_size != "1920,1080":
-            self.assertIn("Chromium window size from kmsprint: " + expected_size.replace(",", "x"), output)
+        if x_status == 0 and x_output.startswith("Screen") and expected_size != "1920,1080":
+            self.assertIn("Chromium window size from X: " + expected_size.replace(",", "x"), output)
+        elif kms_status == 0 and kms_output and expected_size != "1920,1080":
+            self.assertIn("Chromium window size from kmsprint (after X startup): " + expected_size.replace(",", "x"), output)
         elif kms_status != 0 or not kms_output:
-            self.assertIn("WARN: no active resolution from kmsprint; using Chromium window size 1920x1080", output)
+            self.assertIn("WARN: no active resolution from X or kmsprint; using Chromium window size 1920x1080", output)
         return parts
+
+    def test_kiosk_sizes_after_x_changes_console_mode_to_4k(self):
+        console = "Connector 0 (33) HDMI-A-1 (connected)\n    Crtc 2 (92) 1536x768@60.00\n"
+        x_state = "Screen 0: minimum 320 x 200, current 3840 x 2160, maximum 16384 x 16384\n"
+        # The X screen is authoritative even if KMS reports an old console mode.
+        self.launch_kiosk(x_output=x_state, kms_before_output=console, kms_output=console,
+                          expected_size="3840,2160")
+        self.assertFalse((self.root / "kms-calls").exists())
+
+    def test_kiosk_kms_fallback_also_runs_after_x_changes_the_mode(self):
+        console = "Connector 0 (33) HDMI-A-1 (connected)\n    Crtc 2 (92) 1536x768@60.00\n"
+        active = "Connector 0 (33) HDMI-A-1 (connected)\n    Crtc 2 (92) 3840x2160@60.00\n"
+        self.launch_kiosk(x_status=127, kms_before_output=console, kms_output=active,
+                          expected_size="3840,2160")
+
+    def test_kiosk_uses_x_current_size_not_supported_modes_or_rotated_dimensions(self):
+        x_state = """Screen 0: minimum 320 x 200, current 2560 x 1440, maximum 32767 x 32767
+HDMI-1 connected primary 2560x1440+0+0 (normal left inverted right x axis y axis)
+   3840x2160     60.00 +
+   2560x1440     60.00*
+"""
+        for angle in ("0", "90", "180", "270"):
+            with self.subTest(angle=angle):
+                self.launch_kiosk(orientation=angle, x_output=x_state, expected_size="2560,1440")
+
+    def test_x_resolution_detection_rejects_errors_and_bad_dimensions(self):
+        for output, status in (("", 0), ("Screen 0: current 0 x 2160,", 0),
+                               ("Screen 0: current 3840 x invalid,", 0),
+                               ("Screen 0: current 3840 x 2160,", 1)):
+            with self.subTest(output=output, status=status):
+                result = self.run_shell(
+                    f"xrandr() {{ printf '%s' {shlex.quote(output)}; return {status}; }}\n"
+                    "if x_window_size; then exit 99; fi\necho NO-X\n", names=("x_window_size",))
+                self.assertEqual(result, "NO-X\n")
+
+    def test_x_resolution_detection_handles_missing_command(self):
+        output = self.run_shell(r'''
+command() {
+  if [[ "$*" == "-v xrandr" ]]; then return 1; fi
+  builtin command "$@"
+}
+if x_window_size; then exit 99; fi
+echo NO-X
+''', names=("x_window_size",))
+        self.assertEqual(output, "NO-X\n")
+
+    def test_session_still_launches_when_blanking_setup_fails_and_returns_browser_status(self):
+        output = self.run_shell(r'''
+xrandr() { echo 'Screen 0: minimum 320 x 200, current 3840 x 2160, maximum 16384 x 16384'; }
+xset() { return 1; }
+exec() {
+  [[ "$1" == /usr/bin/chromium ]] || return 99
+  echo BROWSER-STARTED
+  return 37
+}
+export -f xrandr xset exec
+/bin/bash "$SCRIPT_DIR/tvads.sh" --chromium-session 'https://example.test/ads/STATION?secret=test-only'
+''', expected=37)
+        self.assertIn("Chromium window size from X: 3840x2160", output)
+        self.assertIn("WARN: could not disable display blanking", output)
+        self.assertIn("BROWSER-STARTED", output)
+        self.assertNotIn("secret", output)
 
     def test_kiosk_uses_active_4k_mode_instead_of_scaled_framebuffer(self):
         kms_output = """Connector 0 (32) HDMI-A-1 (connected)
