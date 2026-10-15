@@ -1,5 +1,8 @@
 # Native and Chromium playback
 
+Release `2026.10.14.1` handles the native [`REBOOT_PLAYER` device command](device-commands.md)
+through a detached `tvstop && tvstart` worker, including while Chromium is active.
+
 Release `2026.10.11.6` applies explicit kernel `video=` resolutions to X before
 launching Chromium. A venue's configured HDMI mode takes precedence over X's
 automatic choice, and Chromium is sized after the configured mode is applied.

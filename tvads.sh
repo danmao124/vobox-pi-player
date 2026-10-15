@@ -3,7 +3,7 @@ set -euo pipefail
 
 # Bump for each player release, including changes to playback_report.py.
 # Captured by the running process; updating files takes effect after restart.
-readonly PLAYER_VERSION="2026.10.11.6"
+readonly PLAYER_VERSION="2026.10.14.1"
 
 log(){ echo "[$(date '+%F %T')] $*"; }
 
@@ -867,6 +867,37 @@ set_wifi_profile() {
   log "setWifi: saved Wi-Fi profile (autoconnect enabled, retries forever)"
 }
 
+# Run outside venditt-player.service: tvstop can kill this poller and all children
+# in its cgroup. Backgrounding/nohup alone would also lose the pending tvstart.
+# Requires the same passwordless sudo for systemd-run as the Wi-Fi wizard.
+reboot_player() {
+  local rc=0
+  if ! command -v systemd-run >/dev/null 2>&1; then
+    log "WARN: REBOOT_PLAYER requires systemd-run; player left running"
+    return 1
+  fi
+
+  log "REBOOT_PLAYER: handing tvstop && tvstart to vobox-reboot-player.service"
+  # A fixed unit name prevents overlapping restarts. Collect failed units too so
+  # an operator can retry. Type=exec confirms launch, not completion; do not wait
+  # for the worker or tie its lifetime/stdio to this service with --scope/--pipe.
+  # Only literal shell code runs as root; no command fields are interpolated.
+  sudo -n systemd-run --unit=vobox-reboot-player --collect \
+    --property=Type=exec /bin/bash -c '
+      if ! command -v tvstop >/dev/null 2>&1 || ! command -v tvstart >/dev/null 2>&1; then
+        echo "REBOOT_PLAYER: tvstop and tvstart must be installed on the system service PATH" >&2
+        exit 127
+      fi
+      echo "REBOOT_PLAYER: running tvstop && tvstart"
+      tvstop && tvstart
+    ' >/dev/null 2>&1 || rc=$?
+  if (( rc != 0 )); then
+    log "WARN: REBOOT_PLAYER could not launch restart worker (exit ${rc}); check systemd, passwordless sudo for systemd-run, and vobox-reboot-player.service"
+    return 1
+  fi
+  return 0
+}
+
 ask_for_event() {
   local url body json curl_rc=0 requested_at
   url="${API_BASE}/${ASK_FOR_EVENT_PATH}"
@@ -932,11 +963,22 @@ ask_for_event() {
   # Log unsupported command types.
   jq -r '
     (.response.data // [])[]
-    | select((.type // "") != "sync" and (.type // "") != "setWifi")
+    | select((.type // "") != "sync" and (.type // "") != "setWifi" and (.type // "") != "REBOOT_PLAYER")
     | "askForEvent: ignoring type=\(.type // "?")"
   ' <<<"$json" 2>/dev/null | while IFS= read -r line; do
     [[ -n "$line" ]] && log "$line"
   done || true
+
+  # The backend drains untimed commands when returning this response; there is
+  # no separate completion ACK. Finish the other commands before stopping their
+  # receiver, and coalesce multiple reboot requests in this batch into one.
+  if jq -e '
+    .response | select(.success == true)
+    | .data | select(type == "array")
+    | any(.[]; type == "object" and .type == "REBOOT_PLAYER")
+  ' <<<"$json" >/dev/null 2>&1; then
+    reboot_player || true
+  fi
 }
 
 event_poll_loop() {
