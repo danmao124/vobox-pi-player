@@ -1,5 +1,9 @@
 # Native and Chromium playback
 
+Release `2026.10.26.1` advances through backend batches while asset downloads
+continue independently. Download startup is serialized to prevent duplicate
+transfers when playback and sync encounter the same uncached asset together.
+
 Release `2026.10.25.1` keeps native playback running when a watchdog/manual sync
 batch has unfinished downloads, skips unconfirmed mpv loads without a blind retry
 or full image timer, and retains mpv warnings in the service journal. Asset
@@ -158,17 +162,23 @@ response to select Chromium. Multiple stations start Chromium immediately.
 Native sync prefetches missing assets and reuses existing in-flight asset
 downloads. A sync must have every target asset cached before it can interrupt an
 image, video, or asset boundary. If the deadline has passed and assets are still
-missing at a batch check, the player logs `Sync missed: assets not ready`, keeps
-its current batch, and clears that staged sync. Downloads continue independently;
-the download timeout and network-recovery checks can still abort them.
+missing at a batch check, the player logs `Sync missed: assets not ready`, clears
+that staged sync, and continues ordinary playback and batch progression.
+Downloads continue independently; the download timeout and network-recovery
+checks can still abort them.
 
 Each native asset download has a 90-minute (5,400-second) total timeout and a
 five-second connection timeout. At 0.1 Mbps, 50 MB takes about 67 minutes and
 56.6 MB takes about 75 minutes, before overhead or pauses. Playback continues
-with cached assets while downloads run. The current batch can repeat until its
-downloads finish or fail, unless a ready sync replaces it. Network-recovery checks
-can still abort a download before the total timeout; failed partial downloads
-are discarded, so a later attempt starts from the beginning.
+with cached assets while downloads run, advancing to the next backend batch
+after each pass even when an earlier batch has unfinished downloads. If nothing
+in a batch can play, the loop waits five seconds before advancing to avoid rapid
+API requests. If the next batch is not available yet, it retries the current
+batch without replacing an active backend fetch. A repeated asset reuses its
+live download or completed cache file; a failed download can be retried when the
+asset is encountered again. Network-recovery checks cover downloads from all
+batches and can still abort a download before the total timeout; failed partial
+downloads are discarded, so a later attempt starts from the beginning.
 
 Each player process creates a new `playbackSession`. Native heartbeats report it
 with `playbackMode: "mpv"` or `"chromium"`. mpv retains its existing confirmed

@@ -18,6 +18,129 @@ def shell_functions(*names):
 
 
 class BackgroundDownloadTests(unittest.TestCase):
+    def download_script(self, root):
+        return shell_functions(
+            "cache_path_for_url", "asset_lock_path", "asset_download_in_progress",
+            "claim_asset_download", "start_asset_download_bg", "cache_asset",
+            "abort_in_flight_asset_downloads", "asset_downloads_in_progress",
+        ) + f"\nASSET_DIR={shlex.quote(str(root))}\n" + r'''
+CURL_ASSET_OPTS=(stub)
+log() { echo "$*" >&2; }
+build_curl_auth_headers() { curl_headers=(stub); }
+note_fetch_reach_ok() { :; }
+internet_ping_ok() { return 0; }
+wait_for() {
+  for _ in {1..500}; do [[ -f "$1" ]] && return 0; sleep 0.01; done
+  return 99
+}
+wait_finished() {
+  for _ in {1..500}; do
+    [[ ! -f "$ASSET_DIR/video.mp4.lock" ]] && return 0
+    sleep 0.01
+  done
+  return 98
+}
+'''
+
+    def test_parallel_encounters_reuse_download_during_startup_and_after_batch_change(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            script = self.download_script(root) + r'''
+# Force overlapping callers while authentication is still being prepared.
+build_curl_auth_headers() { wait_for "$ASSET_DIR/auth-release"; curl_headers=(stub); }
+curl() {
+  echo attempt >> "$ASSET_DIR/attempts"
+  printf partial > "$tmp"
+  touch "$ASSET_DIR/download-started"
+  wait_for "$ASSET_DIR/release"
+  printf complete > "$tmp"
+}
+for _ in {1..12}; do start_asset_download_bg https://cdn.test/video.mp4 & done
+wait
+touch "$ASSET_DIR/queued"
+wait_for "$ASSET_DIR/download-started"
+echo https://cdn.test/another-batch.png > "$ASSET_DIR/main.txt"
+asset_downloads_in_progress
+cache_asset 'https://cdn.test/video.mp4?new-signature=1' || true
+touch "$ASSET_DIR/repeated"
+wait_for "$ASSET_DIR/release"
+wait_finished
+'''
+            with (root / "download.log").open("w") as log, subprocess.Popen(
+                ["bash", "-euo", "pipefail", "-c", script], stdout=log, stderr=log,
+            ) as process:
+                try:
+                    self.wait_for_file(root / "queued")
+                    self.wait_for_file(root / "video.mp4.lock")
+                    worker = (root / "video.mp4.lock").read_text()
+                    self.assertFalse((root / "attempts").exists())
+                    (root / "auth-release").touch()
+                    self.wait_for_file(root / "repeated")
+                    self.assertEqual((root / "video.mp4.lock").read_text(), worker)
+                    self.assertEqual((root / "video.mp4.tmp").read_text(), "partial")
+                finally:
+                    (root / "auth-release").touch()
+                    (root / "release").touch()
+                    process.wait(timeout=7)
+                self.assertEqual(process.returncode, 0, (root / "download.log").read_text())
+            self.assertEqual((root / "attempts").read_text().splitlines(), ["attempt"])
+            self.assertEqual((root / "video.mp4").read_text(), "complete")
+            self.assertFalse((root / "video.mp4.tmp").exists())
+
+    def test_failed_download_can_retry_and_completed_file_is_reused(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / "video.mp4.lock").write_text("999999999\n")
+            (root / "video.mp4.tmp").write_text("stale partial")
+            script = self.download_script(root) + r'''
+curl() {
+  [[ ! -f "$tmp" ]] || return 99
+  if [[ ! -f "$ASSET_DIR/first-attempt" ]]; then
+    touch "$ASSET_DIR/first-attempt"
+    printf failed > "$tmp"
+    return 22
+  fi
+  echo retry >> "$ASSET_DIR/attempts"
+  printf complete > "$tmp"
+}
+cache_asset https://cdn.test/video.mp4 || true
+wait_for "$ASSET_DIR/first-attempt"
+wait_finished
+[[ ! -f "$ASSET_DIR/video.mp4.tmp" ]]
+cache_asset https://cdn.test/video.mp4 || true
+wait_for "$ASSET_DIR/video.mp4"
+wait_finished
+cache_asset https://cdn.test/video.mp4
+'''
+            result = subprocess.run(["bash", "-euo", "pipefail", "-c", script],
+                                    capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual((root / "attempts").read_text().splitlines(), ["retry"])
+            self.assertEqual(result.stdout.strip(), str(root / "video.mp4"))
+
+    def test_network_abort_stops_worker_curl_and_removes_partial(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            script = self.download_script(root) + r'''
+curl() {
+  trap 'touch "$ASSET_DIR/curl-stopped"; exit 143' TERM
+  printf partial > "$tmp"
+  touch "$ASSET_DIR/download-started"
+  wait_for "$ASSET_DIR/never-release"
+}
+cache_asset https://cdn.test/video.mp4 || true
+wait_for "$ASSET_DIR/download-started"
+abort_in_flight_asset_downloads
+wait_finished
+[[ ! -f "$ASSET_DIR/video.mp4.tmp" ]]
+! asset_downloads_in_progress
+'''
+            result = subprocess.run(["bash", "-euo", "pipefail", "-c", script],
+                                    capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue((root / "curl-stopped").exists())
+            self.assertFalse((root / "video.mp4").exists())
+
     def wait_for_file(self, path):
         deadline = time.monotonic() + 3
         while not path.exists():
@@ -33,7 +156,7 @@ class BackgroundDownloadTests(unittest.TestCase):
                 cached.write_text("cached ad")
                 script = shell_functions(
                     "cache_path_for_url", "asset_lock_path", "asset_download_in_progress",
-                    "start_asset_download_bg", "cache_asset",
+                    "claim_asset_download", "start_asset_download_bg", "cache_asset",
                 )
                 script += f"\nASSET_DIR={shlex.quote(d)}\nDOWNLOAD_RESULT={download_result}\n"
                 script += r'''
@@ -138,7 +261,8 @@ sync_should_interrupt_playback() {
 }
 date() { echo 100; }
 bump_fetch_gen() { :; }
-batch_has_downloads_in_progress() { return 1; }
+asset_downloads_in_progress() { return 1; }
+swap_pending_if_any() { :; }
 python3() { :; }
 sleep() { echo "SLEEP $1"; }
 log() { echo "$*"; }
@@ -178,6 +302,101 @@ main
         self.assertIn("Sync missed: assets not ready", output)
         self.assertNotIn("PLAY https://example.com/new.jpg", output)
         self.assertEqual(output.count("PLAY https://example.com/old.jpg position=1"), 2)
+
+
+class BatchAdvanceTests(unittest.TestCase):
+    def test_next_batch_plays_while_downloads_continue_even_if_nothing_was_playable(self):
+        for playable in (0, 1):
+            with self.subTest(playable=playable), tempfile.TemporaryDirectory() as d:
+                root = Path(d)
+                names = ("MAIN_LIST", "PENDING_LIST", "INDEX_FILE", "NEXT_FILE",
+                         "NEXT_BLAST_FILE", "PLAYBACK_HISTORY")
+                script = "\n".join(f"{name}={shlex.quote(str(root / name))}" for name in names)
+                script += f"\nPLAYABLE={playable}\n" + shell_functions(
+                    "main", "promote_main_list", "swap_pending_if_any", "read_next_blast_index",
+                ) + r'''
+PLAYER_VERSION=test EVENT_SLOT=0 blast_idx=0 SCRIPT_DIR=unused ID=TEST
+KIOSK_BOOTSTRAPPED="" plays=0
+ensure_dirs() { :; }
+start_wifi_hotkey() { :; }
+clear_sync_pending() { :; }
+sync_web_kiosk() { :; }
+event_poll_loop() { :; }
+start_mpv_if_needed() { :; }
+wait_while_wizard() { :; }
+cleanup_cache() { :; }
+browser_requested() { return 1; }
+sync_should_interrupt_playback() { return 1; }
+apply_sync_if_due() { return 1; }
+normalize_url() { echo "$1"; }
+asset_downloads_in_progress() { return 0; }
+internet_ping_ok() { return 0; }
+abort_in_flight_asset_downloads() { echo WRONG-ABORT; exit 99; }
+python3() { :; }
+log() { echo "$*"; }
+sleep() { echo "SLEEP $1"; }
+fetch_batch_to() {
+  printf 'https://cdn.test/cached.png\nhttps://cdn.test/downloading.mp4\n' > "$3"
+  echo 1 > "$4"
+  echo 0 > "$5"
+}
+start_background_fetch_pending() { echo https://cdn.test/next.png > "$PENDING_LIST"; }
+play_url() {
+  plays=$((plays + 1))
+  (( plays <= 3 )) || exit 99
+  echo "PLAY $1"
+  [[ "$1" != */next.png ]] || exit 0
+  [[ "$1" == */cached.png ]] && (( PLAYABLE ))
+}
+main
+'''
+                result = subprocess.run(["bash", "-euo", "pipefail", "-c", script],
+                                        capture_output=True, text=True, timeout=5)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("PLAY https://cdn.test/next.png", result.stdout)
+                self.assertEqual("SLEEP 5" in result.stdout, not playable)
+                self.assertNotIn("WRONG-ABORT", result.stdout)
+
+    def test_waiting_for_next_batch_does_not_replace_active_api_fetch(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            script = f"STATE_DIR={shlex.quote(d)}\n" + shell_functions(
+                "read_fetch_gen", "bump_fetch_gen", "start_background_fetch_pending",
+                "pending_fetch_in_progress", "swap_pending_if_any",
+            ) + r'''
+FETCH_GEN_FILE="$STATE_DIR/gen" PENDING_LIST="$STATE_DIR/pending"
+INDEX_FILE="$STATE_DIR/index" blast_idx=0
+echo 0 > "$FETCH_GEN_FILE"
+echo 1 > "$INDEX_FILE"
+cleanup_cache() { :; }
+read_next_blast_index() { :; }
+background_fetch_pending() {
+  echo "$3" >> "$STATE_DIR/requests"
+  for _ in {1..500}; do
+    [[ ! -f "$STATE_DIR/release" ]] || return 0
+    sleep 0.01
+  done
+  return 99
+}
+start_background_fetch_pending 1 0
+original_pid="$PENDING_FETCH_PID"
+swap_pending_if_any
+swap_pending_if_any
+[[ "$PENDING_FETCH_PID" == "$original_pid" ]]
+[[ "$(read_fetch_gen)" == 1 ]]
+touch "$STATE_DIR/release"
+for _ in {1..500}; do pending_fetch_in_progress || break; sleep 0.01; done
+! pending_fetch_in_progress
+# A completed/failed request must still be retried if it published no batch.
+swap_pending_if_any
+for _ in {1..500}; do pending_fetch_in_progress || break; sleep 0.01; done
+! pending_fetch_in_progress
+[[ "$(read_fetch_gen)" == 2 ]]
+'''
+            result = subprocess.run(["bash", "-euo", "pipefail", "-c", script],
+                                    capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual((root / "requests").read_text().splitlines(), ["1", "2"])
 
 
 class PlaybackFailureTests(unittest.TestCase):

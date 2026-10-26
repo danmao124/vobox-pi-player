@@ -3,7 +3,7 @@ set -euo pipefail
 
 # Bump for each player release, including changes to playback_report.py.
 # Captured by the running process; updating files takes effect after restart.
-readonly PLAYER_VERSION="2026.10.25.1"
+readonly PLAYER_VERSION="2026.10.26.1"
 
 log(){ echo "[$(date '+%F %T')] $*"; }
 
@@ -512,19 +512,45 @@ asset_download_in_progress() {
   [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null
 }
 
-# Kill hung/in-flight asset curls so a dead Wi-Fi doesn't pin the batch for max-time.
+# Workers own their curl and partial file; signal them to clean up together.
 abort_in_flight_asset_downloads() {
-  local lock pid tmp
+  local lock pid
   for lock in "$ASSET_DIR"/*.lock; do
     [[ -f "$lock" ]] || continue
     pid="$(cat "$lock" 2>/dev/null || true)"
-    tmp="${lock%.lock}.tmp"
     if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
       log "Aborting asset download pid=$pid"
       kill "$pid" 2>/dev/null || true
     fi
-    rm -f "$lock" "$tmp" >/dev/null 2>&1 || true
   done
+}
+
+# Serialize only download startup. The worker stays alive until its curl exits,
+# so another batch or sync cannot reclaim its PID lock during startup/cleanup.
+claim_asset_download() {
+  python3 - "$path" "$lock" "$tmp" <<'PY'
+import fcntl
+import os
+from pathlib import Path
+import sys
+
+path, lock, partial = map(Path, sys.argv[1:4])
+with (path.parent / ".download-start.lock").open("a") as gate:
+    fcntl.flock(gate, fcntl.LOCK_EX)
+    if path.is_file() and path.stat().st_size > 0:
+        sys.exit(1)
+    try:
+        pid = int(lock.read_text().strip())
+        if pid > 0:
+            os.kill(pid, 0)
+            sys.exit(1)
+    except PermissionError:
+        sys.exit(1)  # Treat an inaccessible live worker as active.
+    except (FileNotFoundError, ProcessLookupError, ValueError):
+        pass
+    partial.unlink(missing_ok=True)
+    lock.write_text(str(os.getppid()) + "\n")
+PY
 }
 
 # Kick off a non-blocking download if needed. Never blocks the play loop.
@@ -540,19 +566,19 @@ start_asset_download_bg() {
     return 0
   fi
 
-  # Stale lock / leftover partial from a previous crash
-  rm -f "$lock" "$tmp" >/dev/null 2>&1 || true
-
   # Redirect the background subshell itself so it cannot hold open the stdout
   # pipe captured by src="$(cache_asset ...)" in the playback loop.
   (
     set +e
-    local curl_pid rc=1
+    trap - EXIT INT TERM
+    local curl_pid="" rc=1
+    claim_asset_download || exit 0
+    trap "$(printf 'rm -f -- %q %q' "$tmp" "$lock")" EXIT
+    trap 'if [[ -n "$curl_pid" ]]; then kill "$curl_pid" 2>/dev/null; wait "$curl_pid" 2>/dev/null; fi; exit 143' TERM INT
+    log "Queued download: $url"
     build_curl_auth_headers ""
     curl "${CURL_ASSET_OPTS[@]}" "${curl_headers[@]}" -o "$tmp" "$url" &
     curl_pid=$!
-    echo "$curl_pid" > "$lock"
-    trap 'rm -f "$lock"' EXIT
     wait "$curl_pid"
     rc=$?
     if (( rc == 0 )); then
@@ -570,17 +596,16 @@ start_asset_download_bg() {
     fi
   ) >&2 &
   disown || true
-  log "Queued download: $url" >&2
 }
 
-batch_has_downloads_in_progress() {
-  local url
-  [[ -s "$MAIN_LIST" ]] || return 1
-  while IFS= read -r url; do
-    url="$(normalize_url "$url")"
-    [[ -n "$url" ]] || continue
-    asset_download_in_progress "$url" && return 0
-  done < "$MAIN_LIST"
+asset_downloads_in_progress() {
+  local lock pid
+  # Downloads from earlier batches need the same network recovery checks.
+  for lock in "$ASSET_DIR"/*.lock; do
+    [[ -f "$lock" ]] || continue
+    pid="$(cat "$lock" 2>/dev/null || true)"
+    [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null && return 0
+  done
   return 1
 }
 
@@ -650,7 +675,14 @@ start_background_fetch_pending() {
   local gen
   gen="$(bump_fetch_gen)"
   background_fetch_pending "$idx" "$bidx" "$gen" &
+  PENDING_FETCH_PID=$!
+  PENDING_FETCH_GEN="$gen"
   disown || true
+}
+
+pending_fetch_in_progress() {
+  [[ -n "${PENDING_FETCH_PID:-}" && "${PENDING_FETCH_GEN:-}" == "$(read_fetch_gen)" ]] &&
+    kill -0 "$PENDING_FETCH_PID" 2>/dev/null
 }
 
 read_next_blast_index() {
@@ -1117,15 +1149,21 @@ promote_main_list() {
 }
 
 swap_pending_if_any() {
+  local swapped=0
   if [[ -s "$PENDING_LIST" ]]; then
     log "Swap: pending -> main"
     promote_main_list "$PENDING_LIST"
     : > "$PENDING_LIST" || true
+    swapped=1
   fi
 
   cleanup_cache
   read_next_blast_index
-  start_background_fetch_pending "$(cat "$INDEX_FILE" 2>/dev/null || echo "0")" "$blast_idx"
+  # Empty/uncached batches can finish before the API responds. Do not keep
+  # invalidating that response by launching a new fetch on every short pass.
+  if (( swapped )) || ! pending_fetch_in_progress; then
+    start_background_fetch_pending "$(cat "$INDEX_FILE" 2>/dev/null || echo "0")" "$blast_idx"
+  fi
 }
 
 # ---------------- mpv IPC ----------------
@@ -1601,27 +1639,18 @@ main() {
       continue
     fi
 
-    # Keep looping the current batch while assets are still downloading so the
-    # display stays on playable creatives instead of freezing on a blocking curl.
-    if batch_has_downloads_in_progress; then
+    # Downloads survive batch changes; keep checking connectivity for all of them.
+    if asset_downloads_in_progress; then
       # Don't wait out curl max-time for Wi-Fi recovery: probe each pass.
       if ! internet_ping_ok; then
         note_fetch_reach_failure "ping 8.8.8.8 failed while assets downloading"
         abort_in_flight_asset_downloads
       fi
-      if (( ! played_any )); then
-        log "Waiting for cached assets before first play..."
-        sleep 3
-      else
-        log "Downloads still running; looping current batch"
-      fi
-      continue
     fi
 
     if (( ! played_any )); then
-      log "No playable assets in batch; waiting before retry..."
+      log "No playable assets in batch; waiting briefly before advancing..."
       sleep 5
-      continue
     fi
 
     swap_pending_if_any
