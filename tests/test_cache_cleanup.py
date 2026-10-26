@@ -56,24 +56,24 @@ class CacheCleanupTests(unittest.TestCase):
         self.assertTrue(cached.exists())
         self.assertNotIn("trimming", result.stdout)
 
-    def test_trims_oldest_first_to_ninety_percent_then_stops(self):
+    def test_trims_oldest_first_to_fifty_percent_then_stops(self):
         files = [self.asset(f"{index}.jpg", mib=2, age=100 + index) for index in range(6)]
         result = self.cleanup()
-        self.assertEqual([file.exists() for file in files], [False, False, True, True, True, True])
-        self.assertIn("trimming to 9MB", result.stdout)
-        self.assertIn("removed 2 file(s)", result.stdout)
+        self.assertEqual([file.exists() for file in files], [False, False, False, False, True, True])
+        self.assertIn("trimming to 5MB", result.stdout)
+        self.assertIn("removed 4 file(s)", result.stdout)
         self.assertTrue(self.main.exists())
         self.assertNotIn("trimming", self.cleanup().stdout)
 
     def test_protects_all_three_playlists_and_url_normalization(self):
-        current = self.asset("current image.jpg", mib=2, age=1)
-        pending = self.asset("pending%20image.png", mib=2, age=2)
-        synced = self.asset("sync.mp4", mib=2, age=3)
+        current = self.asset("current image.jpg", mib=1, age=1)
+        pending = self.asset("pending%20image.png", mib=1, age=2)
+        synced = self.asset("sync.mp4", mib=1, age=3)
         self.main.write_bytes(b"https://cdn.example/current image.jpg?token=123,  \r\n")
         self.pending.write_text("https://cdn.example/pending%20image.png?version=2\n")
         self.sync.write_text("https://cdn.example/sync.mp4")
-        orphan = self.asset("old.jpg", mib=2, age=4)
-        newer = self.asset("new.jpg", mib=2.5, age=5)
+        orphan = self.asset("old.jpg", mib=6, age=4)
+        newer = self.asset("new.jpg", mib=1.5, age=5)
         self.cleanup()
         for path in (current, pending, synced, newer):
             self.assertTrue(path.exists(), str(path))
@@ -152,8 +152,8 @@ class CacheCleanupTests(unittest.TestCase):
         self.assertTrue(self.sync.exists())
 
     def test_handles_unusual_filenames_without_touching_links_or_subdirectories(self):
-        old = self.asset("old\nimage.jpg", mib=6)
-        new = self.asset("new image.jpg", mib=6, age=200)
+        old = self.asset("old\nimage.jpg", mib=7)
+        new = self.asset("new image.jpg", mib=4, age=200)
         outside = self.root / "outside.jpg"
         outside.write_text("outside")
         link = self.assets / "linked.jpg"

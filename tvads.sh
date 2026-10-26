@@ -3,7 +3,7 @@ set -euo pipefail
 
 # Bump for each player release, including changes to playback_report.py.
 # Captured by the running process; updating files takes effect after restart.
-readonly PLAYER_VERSION="2026.10.26.1"
+readonly PLAYER_VERSION="2026.10.26.2"
 
 log(){ echo "[$(date '+%F %T')] $*"; }
 
@@ -192,7 +192,7 @@ source "$CONFIG"
 ID="$(python3 "$SCRIPT_DIR/playback_mode.py" stations "$ID")"
 
 IMAGE_SECONDS="${IMAGE_SECONDS:-15}"
-MAX_CACHE_MB="${MAX_CACHE_MB:-30000}" # Trim above this limit to 90%; keep active assets.
+MAX_CACHE_MB="${MAX_CACHE_MB:-30000}" # Trim above this limit to 50%; keep active assets.
 ORIENTATION="${ORIENTATION:-0}"  # Screen orientation: 0, 90, 180, or 270
 WEB_STATION="${WEB_STATION:-}"  # Optional web station id
 UNMUTED_ID="${UNMUTED_ID:-}"  # Optional top-level or nested ad station to unmute in Chromium.
@@ -1053,7 +1053,7 @@ def cleanup():
     if limit_mb <= 0:
         raise ValueError("MAX_CACHE_MB must be positive")
     playlists = [Path(path) for path in sys.argv[4:]]
-    target_mb = limit_mb * 90 // 100
+    target_mb = limit_mb * 50 // 100
     target_bytes = target_mb * 1024 * 1024
 
     def usage_bytes():
