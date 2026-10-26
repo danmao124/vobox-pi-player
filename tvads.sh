@@ -3,7 +3,7 @@ set -euo pipefail
 
 # Bump for each player release, including changes to playback_report.py.
 # Captured by the running process; updating files takes effect after restart.
-readonly PLAYER_VERSION="2026.10.14.1"
+readonly PLAYER_VERSION="2026.10.25.1"
 
 log(){ echo "[$(date '+%F %T')] $*"; }
 
@@ -228,7 +228,8 @@ build_curl_auth_headers() {
 }
 
 CURL_API_OPTS=(--fail --silent --show-error --connect-timeout 5 --max-time 10 -L)
-CURL_ASSET_OPTS=(--fail --silent --show-error --connect-timeout 5 --max-time 500 -L)
+# Allow 90 minutes: a 50 MB asset needs about 67 minutes at 0.1 Mbps.
+CURL_ASSET_OPTS=(--fail --silent --show-error --connect-timeout 5 --max-time 5400 -L)
 JQ_URLS='.response.data[]?.url // empty'
 JQ_INDEX='.response.index // .response.message // empty'
 JQ_BLAST='.response.blastIndex // empty'
@@ -755,14 +756,16 @@ apply_sync_if_due() {
   return 0
 }
 
-# True when a staged sync should cut into current playback (due or within ~1s).
+# Interrupt only for a ready staged batch (due or within ~1s). A slow download
+# must not cut short the current asset before apply_sync_if_due rejects it.
 sync_should_interrupt_playback() {
   local at now
   [[ -f "$SYNC_AT_FILE" && -s "$SYNC_LIST" ]] || return 1
   at="$(cat "$SYNC_AT_FILE" 2>/dev/null || true)"
   [[ "$at" =~ ^[0-9]+$ ]] || return 1
   now="$(date +%s)"
-  (( now >= at - 1 ))
+  (( now >= at - 1 )) || return 1
+  python3 "$SCRIPT_DIR/playback_report.py" sync-ready "$SYNC_LIST" "$ASSET_DIR"
 }
 
 # Busy-wait until play-at (if still in the future). Do not stop mpv — next
@@ -1153,7 +1156,9 @@ start_mpv_if_needed() {
   rm -f "$MPV_SOCK" || true
   log "Starting mpv (persistent fullscreen, IPC, rotation=${ORIENTATION}°)"
 
-  mpv --fs --no-border --really-quiet \
+  # Keep decoder/VO warnings in the service journal, without status-line noise.
+  mpv --fs --no-border --quiet --msg-level=all=warn --msg-color=no \
+    --input-terminal=no \
     --hwdec=auto \
     --mute=yes --volume=0 \
     --idle=yes --force-window=yes \
@@ -1166,7 +1171,7 @@ start_mpv_if_needed() {
     --reset-on-next-file=no \
     --video-rotate="$ORIENTATION" \
     --input-ipc-server="$MPV_SOCK" \
-    >/dev/null 2>&1 &
+    </dev/null &
 
   # wait for socket
   for _ in {1..80}; do
@@ -1222,7 +1227,7 @@ mpv_wait_until_eof_with_timeout() {
 
 # Returns 0 if shown, 1 if skipped, 2 for sync cutover, 3 for browser cutover.
 play_url() {
-  local url src playback_start
+  local url src playback_start kind=image
   url="$(normalize_url "$1")"
   browser_requested && return 3
 
@@ -1242,16 +1247,20 @@ play_url() {
   start_mpv_if_needed || return $?
 
   if is_video "$url"; then
+    kind=video
     mpv_send '{"command":["set_property","loop-file","no"]}'
   else
     mpv_send '{"command":["set_property","loop-file","inf"]}'
   fi
 
+  log "Playback load: position=$item_position kind=$kind src=$(printf '%q' "$src")"
   if ! playback_start="$(python3 "$SCRIPT_DIR/playback_report.py" load "$MPV_SOCK" "$src" "$MAIN_LIST" "$item_position" "$PLAYBACK_HISTORY")"; then
-    playback_start=""
-    log "WARN: playback reporting unavailable; loading without telemetry: $url"
-    mpv_send "$(jq -nc --arg src "$src" '{command:["loadfile",$src,"replace"]}')"
+    # Do not retry blindly and then spend an entire image/video slot on a load
+    # that mpv never confirmed. The next cached asset replaces this one.
+    log "WARN: skip (mpv playback not confirmed): position=$item_position kind=$kind src=$(printf '%q' "$src")"
+    return 1
   fi
+  log "Playback confirmed: position=$item_position kind=$kind src=$(printf '%q' "$src")"
   log "DBG: want_src=$(printf '%q' "$src") mpv_path=$(mpv_get_prop_data path) mpv_filename=$(mpv_get_prop_data filename)"
 
   if is_video "$url"; then
@@ -1267,7 +1276,7 @@ play_url() {
   else
     local image_wait_rc=0
     python3 "$SCRIPT_DIR/playback_report.py" wait-image "$playback_start" "$IMAGE_SECONDS" \
-      "$WIZARD_LOCK" "$SYNC_AT_FILE" "$SYNC_LIST" "$PLAYBACK_MODE_FILE" "$ID" || image_wait_rc=$?
+      "$WIZARD_LOCK" "$SYNC_AT_FILE" "$SYNC_LIST" "$PLAYBACK_MODE_FILE" "$ID" "$ASSET_DIR" || image_wait_rc=$?
     if (( image_wait_rc == 2 )); then
       wait_out_sync_deadline
       return 2

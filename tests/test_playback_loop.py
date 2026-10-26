@@ -180,5 +180,79 @@ main
         self.assertEqual(output.count("PLAY https://example.com/old.jpg position=1"), 2)
 
 
+class PlaybackFailureTests(unittest.TestCase):
+    def run_play(self, *, cached, confirmed, url):
+        script = shell_functions("play_url") + f"\nCACHED={int(cached)} CONFIRMED={int(confirmed)}\n"
+        script += r'''
+normalize_url() { echo "$1"; }
+browser_requested() { return 1; }
+cache_asset() { (( CACHED )) || return 1; echo /cache/asset; }
+wait_while_wizard() { :; }
+start_mpv_if_needed() { echo START-MPV; }
+is_video() { [[ "$1" == *.mp4 ]]; }
+mpv_send() { echo "MPV $1"; }
+mpv_get_prop_data() { echo /cache/asset; }
+mpv_get_duration_secs() { echo 22; }
+mpv_wait_until_eof_with_timeout() { echo VIDEO-WAIT; }
+log() { echo "$*"; }
+python3() {
+  case "$2" in
+    load) (( CONFIRMED )) || return 1; echo 123 ;;
+    wait-image) echo IMAGE-WAIT ;;
+  esac
+}
+SCRIPT_DIR=unused MPV_SOCK=unused MAIN_LIST=unused item_position=1 PLAYBACK_HISTORY=unused
+IMAGE_SECONDS=15 WIZARD_LOCK=unused SYNC_AT_FILE=unused SYNC_LIST=unused
+PLAYBACK_MODE_FILE=unused ID=TEST ASSET_DIR=unused
+rc=0
+'''
+        script += f"play_url {shlex.quote(url)} || rc=$?\necho result=$rc\n"
+        return subprocess.run(["bash", "-euo", "pipefail", "-c", script],
+                              capture_output=True, text=True, check=True, timeout=5).stdout
+
+    def test_downloading_video_does_not_send_any_mpv_commands_or_wait(self):
+        output = self.run_play(cached=False, confirmed=False, url="https://cdn.test/video.mp4")
+        self.assertIn("skip (not cached yet)", output)
+        self.assertIn("result=1", output)
+        self.assertNotIn("MPV", output)
+        self.assertNotIn("WAIT", output)
+
+    def test_failed_load_never_reloads_or_waits_out_image_or_video_slot(self):
+        for ext in ("png", "mp4"):
+            with self.subTest(ext=ext):
+                output = self.run_play(cached=True, confirmed=False, url=f"https://cdn.test/asset.{ext}")
+                self.assertIn("skip (mpv playback not confirmed)", output)
+                self.assertIn("result=1", output)
+                self.assertNotIn("loadfile", output)
+                self.assertNotIn("WAIT", output)
+
+    def test_confirmed_image_and_video_keep_their_normal_wait(self):
+        for ext, wait in (("png", "IMAGE-WAIT"), ("mp4", "VIDEO-WAIT")):
+            with self.subTest(ext=ext):
+                output = self.run_play(cached=True, confirmed=True, url=f"https://cdn.test/asset.{ext}")
+                self.assertIn(wait, output)
+                self.assertIn("Playback confirmed", output)
+                self.assertIn("result=0", output)
+
+    def test_sync_cannot_interrupt_video_or_asset_boundary_until_files_are_cached(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / "sync.txt").write_text("https://cdn.test/video.mp4\n")
+            (root / "sync_at.txt").write_text("100")
+            (root / "video.mp4.tmp").write_bytes(b"partial")
+            script = shell_functions("sync_should_interrupt_playback")
+            script += f"\nSCRIPT_DIR={shlex.quote(str(ROOT))} ASSET_DIR={shlex.quote(d)}\n"
+            script += r'''
+SYNC_LIST="$ASSET_DIR/sync.txt" SYNC_AT_FILE="$ASSET_DIR/sync_at.txt"
+date() { echo 100; }
+if sync_should_interrupt_playback; then echo INTERRUPT; else echo KEEP-PLAYING; fi
+mv "$ASSET_DIR/video.mp4.tmp" "$ASSET_DIR/video.mp4"
+if sync_should_interrupt_playback; then echo READY; else echo WRONG; fi
+'''
+            result = subprocess.run(["bash", "-euo", "pipefail", "-c", script],
+                                    capture_output=True, text=True, check=True, timeout=5)
+            self.assertEqual(result.stdout, "KEEP-PLAYING\nREADY\n")
+
+
 if __name__ == "__main__":
     unittest.main()

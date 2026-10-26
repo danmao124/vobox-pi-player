@@ -65,6 +65,74 @@ class PlaybackReportTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 report.load_and_record("socket", "bad", "unused", 1, "unused")
 
+    def test_decoder_failure_stops_waiting_before_playback(self):
+        sock = MagicMock()
+        sock.__enter__.return_value = sock
+        sock.makefile.return_value = io.StringIO(
+            '{"error":"success"}\n{"event":"start-file"}\n'
+            '{"event":"file-loaded"}\n'
+            '{"event":"end-file","reason":"error","file_error":"decoding failed"}\n'
+            '{"event":"playback-restart"}\n')
+        with patch.object(report.socket, "socket", return_value=sock), \
+                patch.object(report, "save_history") as save:
+            with self.assertRaisesRegex(RuntimeError, "decoding failed"):
+                report.load_and_record("socket", "bad.mp4", "unused", 1, "unused")
+        save.assert_not_called()
+
+    def test_old_asset_end_event_does_not_reject_new_asset(self):
+        with tempfile.TemporaryDirectory() as d:
+            playlist = Path(d, "main.txt")
+            playlist.write_text("asset.png\n")
+            sock = MagicMock()
+            sock.__enter__.return_value = sock
+            sock.makefile.return_value = io.StringIO(
+                '{"event":"end-file","reason":"stop"}\n'
+                '{"error":"success"}\n{"event":"start-file"}\n'
+                '{"event":"file-loaded"}\n{"event":"playback-restart"}\n')
+            with patch.object(report.socket, "socket", return_value=sock):
+                self.assertGreater(report.load_and_record(
+                    "socket", "asset.png", playlist, 1, Path(d, "history.json")), 0)
+
+    def test_reporting_failure_does_not_reject_confirmed_playback(self):
+        sock = MagicMock()
+        sock.__enter__.return_value = sock
+        sock.makefile.return_value = io.StringIO(
+            '{"event":"start-file"}\n{"event":"file-loaded"}\n'
+            '{"event":"playback-restart"}\n')
+        with tempfile.TemporaryDirectory() as d, \
+                patch.object(report.socket, "socket", return_value=sock), \
+                patch.object(report.time, "monotonic_ns", return_value=123), \
+                patch.object(report.sys, "stderr", new_callable=io.StringIO) as stderr:
+            started = report.load_and_record("socket", "asset.png", Path(d, "missing-list"), 1, "unused")
+        self.assertEqual(started, 123)
+        self.assertIn("Playback confirmed; reporting failed", stderr.getvalue())
+        self.assertEqual(sock.sendall.call_count, 1)
+
+    def test_inspect_reads_properties_without_playback_commands(self):
+        sock = MagicMock()
+        sock.__enter__.return_value = sock
+        replies = [{"event": "playback-restart"}]
+        replies += [{"request_id": i, "error": "success", "data": prop}
+                    for i, prop in reversed(list(enumerate(report.DIAGNOSTIC_PROPERTIES, 1)))]
+        replies[1] = {"request_id": replies[1]["request_id"], "error": "property unavailable"}
+        sock.makefile.return_value = io.StringIO("\n".join(map(json.dumps, replies)) + "\n")
+        with patch.object(report.socket, "socket", return_value=sock):
+            result = report.inspect_mpv("socket")
+        self.assertEqual(result["path"], "path")
+        self.assertEqual(result["video-out-params"], {"error": "property unavailable"})
+        self.assertNotIn("unavailable", result)
+        commands = [json.loads(line)["command"] for line in sock.sendall.call_args.args[0].splitlines()]
+        self.assertTrue(all(command[0] == "get_property" for command in commands))
+
+    def test_inspect_reports_unresponsive_mpv(self):
+        sock = MagicMock()
+        sock.__enter__.return_value = sock
+        sock.connect.side_effect = TimeoutError("timed out")
+        with patch.object(report.socket, "socket", return_value=sock):
+            result = report.inspect_mpv("socket")
+        self.assertEqual(result["diagnosticError"], "timed out")
+        self.assertEqual(result["unavailable"], list(report.DIAGNOSTIC_PROPERTIES))
+
     def test_history_and_snapshot_are_bounded(self):
         with tempfile.TemporaryDirectory() as d:
             path = Path(d) / "history.json"
@@ -129,12 +197,40 @@ class ImageDeadlineTests(unittest.TestCase):
             with self.subTest(at=at, playlist=playlist), tempfile.TemporaryDirectory() as d:
                 Path(d, "at").write_text(at)
                 Path(d, "list").write_text(playlist)
+                Path(d, "asset.png").write_bytes(b"cached")
                 with patch.object(report.time, "time_ns", return_value=500_000_000_000), \
                         patch.object(report.time, "monotonic_ns", return_value=120_000_000_000), \
                         patch.object(report.time, "sleep") as sleep:
-                    rc = report.wait_image("100000000000", "15", d + "/wizard", d + "/at", d + "/list")
+                    rc = report.wait_image("100000000000", "15", d + "/wizard", d + "/at", d + "/list", asset_dir=d)
                 self.assertEqual(rc, expected)
                 sleep.assert_not_called()
+
+    def test_sync_with_partial_video_does_not_interrupt_image(self):
+        with tempfile.TemporaryDirectory() as d:
+            Path(d, "at").write_text("100")
+            Path(d, "list").write_text("https://cdn.test/cached.png\nhttps://cdn.test/video.mp4\n")
+            Path(d, "cached.png").write_bytes(b"cached")
+            Path(d, "video.mp4.tmp").write_bytes(b"partial video")
+            clock = [100_000_000_000]
+            def sleep(seconds):
+                clock[0] += round(seconds * 1_000_000_000)
+            with patch.object(report.time, "time_ns", return_value=101_000_000_000), \
+                    patch.object(report.time, "monotonic_ns", side_effect=lambda: clock[0]), \
+                    patch.object(report.time, "sleep", side_effect=sleep):
+                rc = report.wait_image("100000000000", "15", d + "/wizard", d + "/at", d + "/list", asset_dir=d)
+            self.assertEqual(rc, 0)
+            self.assertEqual(clock[0], 115_000_000_000)
+
+    def test_sync_ready_uses_normalized_cache_paths_and_rejects_empty_files(self):
+        with tempfile.TemporaryDirectory() as d:
+            playlist = Path(d, "list")
+            playlist.write_bytes(b"https://cdn.test/video.mp4?token=value, \r\n\n")
+            cached = Path(d, "video.mp4")
+            self.assertFalse(report.sync_assets_ready(playlist, d))
+            cached.touch()
+            self.assertFalse(report.sync_assets_ready(playlist, d))
+            cached.write_bytes(b"complete")
+            self.assertTrue(report.sync_assets_ready(playlist, d))
 
     def test_wifi_wizard_interrupts_a_running_image_wait(self):
         with tempfile.TemporaryDirectory() as d:
@@ -173,7 +269,7 @@ python3() {
 wait_out_sync_deadline() { echo waited-for-sync; }
 SCRIPT_DIR=unused MPV_SOCK=unused MAIN_LIST=unused item_position=1 PLAYBACK_HISTORY=unused
 IMAGE_SECONDS=15 WIZARD_LOCK=unused SYNC_AT_FILE=unused SYNC_LIST=unused
-PLAYBACK_MODE_FILE=unused ID=TEST
+PLAYBACK_MODE_FILE=unused ID=TEST ASSET_DIR=unused
 rc=0
 play_url https://example.com/image.png || rc=$?
 echo "result=$rc"

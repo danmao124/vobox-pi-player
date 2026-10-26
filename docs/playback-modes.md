@@ -1,5 +1,10 @@
 # Native and Chromium playback
 
+Release `2026.10.25.1` keeps native playback running when a watchdog/manual sync
+batch has unfinished downloads, skips unconfirmed mpv loads without a blind retry
+or full image timer, and retains mpv warnings in the service journal. Asset
+downloads now allow up to 90 minutes per attempt for slow venue connections.
+
 Release `2026.10.14.1` handles the native [`REBOOT_PLAYER` device command](device-commands.md)
 through a detached `tvstop && tvstart` worker, including while Chromium is active.
 
@@ -150,6 +155,21 @@ response to select Chromium. Multiple stations start Chromium immediately.
 
 ## Watchdog and manual sync
 
+Native sync prefetches missing assets and reuses existing in-flight asset
+downloads. A sync must have every target asset cached before it can interrupt an
+image, video, or asset boundary. If the deadline has passed and assets are still
+missing at a batch check, the player logs `Sync missed: assets not ready`, keeps
+its current batch, and clears that staged sync. Downloads continue independently;
+the download timeout and network-recovery checks can still abort them.
+
+Each native asset download has a 90-minute (5,400-second) total timeout and a
+five-second connection timeout. At 0.1 Mbps, 50 MB takes about 67 minutes and
+56.6 MB takes about 75 minutes, before overhead or pauses. Playback continues
+with cached assets while downloads run. The current batch can repeat until its
+downloads finish or fail, unless a ready sync replaces it. Network-recovery checks
+can still abort a download before the total timeout; failed partial downloads
+are discarded, so a later attempt starts from the beginning.
+
 Each player process creates a new `playbackSession`. Native heartbeats report it
 with `playbackMode: "mpv"` or `"chromium"`. mpv retains its existing confirmed
 playback reports and timed batch cutovers. Native heartbeats omit mpv telemetry
@@ -181,6 +201,46 @@ native polling and Wi-Fi commands continue without consuming the browser's sync.
 Both manual sync and the existing opt-in drift watchdog can target Chromium and
 mpv devices. As before, sync is an application-level correction, not a guarantee
 of frame-accurate decoding or YouTube network startup.
+
+## Investigating a black screen in native mode
+
+Starting with `2026.10.25.1`, mpv decoder and video-output warnings go to the
+service journal. Each asset has `Playback load` and `Playback confirmed` entries
+with its playlist position, image/video classification, and cached filename.
+`skip (not cached yet)` occurs before any mpv command for that asset. A rejected
+load or a new file ending before playback is skipped immediately; a silent or
+unresponsive load has a five-second confirmation limit. Failed confirmation no
+longer triggers an unverified reload followed by the full 15-second image slot.
+Failure to save telemetry after confirmed playback does not reload or skip it.
+
+Follow the journal on the affected Pi, recording the exact time and hostname:
+
+```sh
+journalctl -u venditt-player.service -f -o short-iso
+```
+
+With the updated helper installed, capture a read-only mpv snapshot while the
+screen is black. This has a two-second time limit and does not change playback:
+
+```sh
+python3 /data/player/playback_report.py inspect /tmp/venditt-mpv.sock
+```
+
+The snapshot includes the selected file, pause/idle/EOF state, playback position,
+selected video track, decoder, hardware decoding, and video-output parameters.
+Unsupported properties are reported as unavailable, not interpreted as failures.
+Compare these with `Playback load`, `Playback confirmed`, `Sync armed`,
+`Applying sync batch`, `Sync missed`, and mpv warning/error messages in the journal.
+An enabled backend watchdog alone does not establish that a sync reached a Pi.
+
+These checks identify load failures and missing sync assets; they do not prove
+that every frame reached the physical screen. An asset can fail after its initial
+confirmation, and a display/GPU failure can occur despite valid media and a
+responsive IPC socket. Validate on a test Pi with a cached image, an unfinished
+video download, another cached image, and a sync targeting that incomplete batch
+before rolling out to the venue. The cached images should retain their full slots
+and the incomplete video should never be loaded. Also test an invalid cached
+asset between two valid images and verify it is skipped without a 15-second wait.
 
 ## Deployment and verification
 
