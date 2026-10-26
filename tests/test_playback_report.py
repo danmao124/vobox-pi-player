@@ -12,6 +12,28 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import playback_report as report
 
 class PlaybackReportTests(unittest.TestCase):
+    def test_image_filter_is_per_file_and_never_attached_to_video(self):
+        for kind in ("image", "video"):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as d:
+                playlist = Path(d, "main.txt")
+                playlist.write_text("asset\n")
+                sock = MagicMock()
+                sock.__enter__.return_value = sock
+                sock.makefile.return_value = io.StringIO(
+                    '{"error":"success"}\n{"event":"start-file"}\n'
+                    '{"event":"file-loaded"}\n{"event":"playback-restart"}\n')
+                with patch.object(report.socket, "socket", return_value=sock):
+                    report.load_and_record("socket", "asset", playlist, 1,
+                                           Path(d, "history.json"), kind)
+                command = json.loads(sock.sendall.call_args.args[0])["command"]
+                if kind == "image":
+                    self.assertEqual(command, {
+                        "name": "loadfile", "url": "asset", "flags": "replace",
+                        "options": {"vf": report.IMAGE_VF}})
+                else:
+                    self.assertEqual(command, ["loadfile", "asset", "replace"])
+                self.assertEqual(sock.sendall.call_count, 1)
+
     def test_confirmed_start_snapshot_and_finish(self):
         with tempfile.TemporaryDirectory() as d:
             history = Path(d) / "history.json"

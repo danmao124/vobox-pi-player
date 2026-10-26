@@ -223,6 +223,39 @@ unresponsive load has a five-second confirmation limit. Failed confirmation no
 longer triggers an unverified reload followed by the full 15-second image slot.
 Failure to save telemetry after confirmed playback does not reload or skip it.
 
+Starting with `2026.10.26.3`, image loads use a per-file software scale filter
+before GPU upload. Both dimensions are bounded to 3840 pixels with aspect ratio
+preserved and no upscaling. This retains full UHD resolution while staying below
+the 4096 texture/renderbuffer limit measured on the test Pi 5 (V3D 7.1.10.2,
+Mesa 25.0.7, mpv 0.40.0). This is a bound for the tested hardware, not a claim that
+every Pi has the same graphics limits. Videos retain their existing filter chain
+and `hwdec=auto`; mpv restores the image's per-file options on unload. Named
+`loadfile` arguments avoid the positional options change in mpv 0.38.
+Original cached files are never rewritten. Roll out `tvads.sh` and
+`playback_report.py` together, then restart the player to use the new version.
+
+Live testing reproduced the venue's texture/framebuffer errors with cached
+3375×4219 PNGs, including an entirely black output capture despite
+`file-loaded` and `playback-restart`. Scaling those files to 3072×3840 rendered
+them successfully. An ordinary 1080×1920 image produced pixel-identical output
+with and without the filter; the following H.264 video had an empty filter chain.
+The test Pi decoded that H.264 video in software, so this confirms preservation
+of the hardware-decoding policy, not successful hardware decoding on this unit.
+The invalid `--reset-on-next-file=no` argument is also removed: that setting is
+a list of option names, and its default already preserves settings.
+
+Run the real software-filter/transition regression on a machine with mpv and
+FFmpeg installed (it uses `vo=null` and does not take over the display):
+
+```sh
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -p test_image_scaling.py -v
+```
+
+See the [mpv loadfile documentation](https://mpv.io/manual/stable/#command-interface-loadfile)
+for per-file option restoration and the
+[reset option documentation](https://mpv.io/manual/stable/#options-reset-on-next-file)
+for its default behavior.
+
 Follow the journal on the affected Pi, recording the exact time and hostname:
 
 ```sh

@@ -11,6 +11,11 @@ from pathlib import Path
 from playback_mode import browser_content
 
 WINDOW_MS = 120_000
+# Keep full UHD's 3840-pixel long edge while staying below the measured
+# 4096 texture/renderbuffer limit on the Pi 5 V3D renderer. Scale in software
+# before GPU upload, never enlarge small images, and preserve aspect ratio.
+IMAGE_VF = ("lavfi=[scale=w='min(iw,3840)':h='min(ih,3840)':"
+            "force_original_aspect_ratio=decrease]")
 DIAGNOSTIC_PROPERTIES = (
     "path", "filename", "idle-active", "pause", "paused-for-cache", "eof-reached",
     "time-pos", "duration", "vid", "video-format", "video-codec", "hwdec-current",
@@ -57,12 +62,19 @@ def next_cursor(playlist, batch_hash):
         return {}
 
 
-def load_and_record(sock_path, src, playlist, position, history_path):
+def load_and_record(sock_path, src, playlist, position, history_path, kind=""):
     # Subscribe before loadfile: its command response precedes actual playback.
     with socket.socket(socket.AF_UNIX) as sock:
         sock.settimeout(5)
         sock.connect(sock_path)
-        sock.sendall((json.dumps({"command": ["loadfile", src, "replace"]}) + "\n").encode())
+        command = ["loadfile", src, "replace"]
+        if kind == "image":
+            # Named arguments work across the positional loadfile change in
+            # mpv 0.38. Per-file options restore on unload, so the next video
+            # retains its original filter chain and hardware decoding policy.
+            command = {"name": "loadfile", "url": src, "flags": "replace",
+                       "options": {"vf": IMAGE_VF}}
+        sock.sendall((json.dumps({"command": command}) + "\n").encode())
         started = loaded = False
         deadline = time.monotonic() + 5
         with sock.makefile("r") as stream:

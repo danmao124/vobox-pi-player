@@ -402,6 +402,7 @@ for _ in {1..500}; do pending_fetch_in_progress || break; sleep 0.01; done
 class PlaybackFailureTests(unittest.TestCase):
     def run_play(self, *, cached, confirmed, url):
         script = shell_functions("play_url") + f"\nCACHED={int(cached)} CONFIRMED={int(confirmed)}\n"
+        script += f"EXPECTED_KIND={'video' if url.endswith('.mp4') else 'image'}\n"
         script += r'''
 normalize_url() { echo "$1"; }
 browser_requested() { return 1; }
@@ -416,7 +417,9 @@ mpv_wait_until_eof_with_timeout() { echo VIDEO-WAIT; }
 log() { echo "$*"; }
 python3() {
   case "$2" in
-    load) (( CONFIRMED )) || return 1; echo 123 ;;
+    load)
+      [[ "$8" == "$EXPECTED_KIND" ]] || return 97
+      (( CONFIRMED )) || return 1; echo 123 ;;
     wait-image) echo IMAGE-WAIT ;;
   esac
 }

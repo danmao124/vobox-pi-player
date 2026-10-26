@@ -3,7 +3,7 @@ set -euo pipefail
 
 # Bump for each player release, including changes to playback_report.py.
 # Captured by the running process; updating files takes effect after restart.
-readonly PLAYER_VERSION="2026.10.26.2"
+readonly PLAYER_VERSION="2026.10.26.3"
 
 log(){ echo "[$(date '+%F %T')] $*"; }
 
@@ -1206,7 +1206,6 @@ start_mpv_if_needed() {
     --keepaspect=no \
     --panscan=0 \
     --no-config \
-    --reset-on-next-file=no \
     --video-rotate="$ORIENTATION" \
     --input-ipc-server="$MPV_SOCK" \
     </dev/null &
@@ -1292,7 +1291,7 @@ play_url() {
   fi
 
   log "Playback load: position=$item_position kind=$kind src=$(printf '%q' "$src")"
-  if ! playback_start="$(python3 "$SCRIPT_DIR/playback_report.py" load "$MPV_SOCK" "$src" "$MAIN_LIST" "$item_position" "$PLAYBACK_HISTORY")"; then
+  if ! playback_start="$(python3 "$SCRIPT_DIR/playback_report.py" load "$MPV_SOCK" "$src" "$MAIN_LIST" "$item_position" "$PLAYBACK_HISTORY" "$kind")"; then
     # Do not retry blindly and then spend an entire image/video slot on a load
     # that mpv never confirmed. The next cached asset replaces this one.
     log "WARN: skip (mpv playback not confirmed): position=$item_position kind=$kind src=$(printf '%q' "$src")"
